@@ -81,7 +81,7 @@ async function sendTestQuery() {
         id: '1',
         method: 'tools/call',
         params: {
-          name: 'SQL_execute_query',
+          name: 'mcp_execute_query', // Updated name
           parameters: {
             sql: 'SELECT TOP 5 name FROM sys.tables'
           }

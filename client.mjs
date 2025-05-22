@@ -400,7 +400,7 @@ async function generateQuery(description, tables = []) {
         }
         
         // Get prompt from server
-        const prompt = await client.getPrompt('generate-query', {
+        const prompt = await client.getPrompt('generate_query', { // Updated prompt name
             description,
             tables
         });
@@ -421,7 +421,7 @@ async function executeQuery(sql) {
         console.log('\n🔍 Executing SQL query...');
         console.log(`Query: ${sql}`);
         
-        const result = await client.callTool('execute-query', { sql });
+        const result = await client.callTool('mcp_execute_query', { sql }); // Updated tool name
         
         console.log('\n✅ SQL query executed successfully!');
         printResult(result);
@@ -435,7 +435,7 @@ async function getTableDetails(tableName) {
     try {
         console.log(`\n🔍 Getting details for table: ${tableName}...`);
         
-        const result = await client.callTool('table-details', { tableName });
+        const result = await client.callTool('mcp_table_details', { tableName }); // Updated tool name
         
         console.log('\n✅ Table details retrieved successfully!');
         printResult(result);

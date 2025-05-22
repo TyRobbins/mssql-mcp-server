@@ -1,4 +1,4 @@
-// lib/resources.js - Database resource implementations
+// lib/resources.mjs - Database resource implementations
 import { executeQuery, sanitizeSqlIdentifier, formatSqlError } from './database.mjs';
 import { logger } from './logger.mjs';
 import { createJsonRpcError } from './errors.mjs';
@@ -46,10 +46,10 @@ export function registerDatabaseResources(server) {
     registerFunctionsListResource(server);
     registerViewsListResource(server);
     registerIndexesListResource(server);
-    registerAiSchemaResource(server);
+    registerAiSchemaResource(server); // Will be changed to ai_schema
     registerDiscoveryResource(server);
     
-    logger.info('Database resources registered successfully');
+    logger.info('Database resources registered successfully.');
 }
 
 /**
@@ -432,11 +432,11 @@ function registerIndexesListResource(server) {
  */
 function registerAiSchemaResource(server) {
     server.resource(
-        "ai-schema",
-        "ai-schema://database",
+        "ai_schema", // Changed to snake_case
+        "ai_schema://database", // Changed to snake_case
         async (uri) => {
             try {
-                logger.info('Generating AI-friendly database schema...');
+                logger.info('Generating AI-friendly database schema for ai_schema resource...');
                 
                 // Get tables
                 const tablesResult = await executeQuery(`
@@ -481,30 +481,38 @@ function registerAiSchemaResource(server) {
                 aiSchemaText += '## MCP Usage Examples\n\n';
                 
                 aiSchemaText += '### Listing Tables\n';
-                aiSchemaText += 'To list tables, use the `tables://list` resource:\n';
+                aiSchemaText += 'To list tables, use the `tables://list` resource (MCP standard read):\n';
                 aiSchemaText += '```javascript\n';
-                aiSchemaText += 'mcp__resources_read("tables://list")\n';
+                aiSchemaText += '// Example: Reading the list of tables\n';
+                aiSchemaText += '// await mcp.read("tables://list");\n';
                 aiSchemaText += '```\n\n';
                 
                 aiSchemaText += '### Executing Queries\n';
-                aiSchemaText += 'To execute a SQL query, use the `execute-query` tool:\n';
+                aiSchemaText += 'To execute a SQL query, use the `mcp_execute_query` tool:\n';
                 aiSchemaText += '```javascript\n';
-                aiSchemaText += 'mcp__execute_query({ sql: "SELECT TOP 100 * FROM [table_name]" })\n';
+                aiSchemaText += 'mcp_execute_query({ sql: "SELECT TOP 100 * FROM [schema_name].[table_name]" })\n';
                 aiSchemaText += '```\n\n';
                 
                 aiSchemaText += '### Getting Table Details\n';
-                aiSchemaText += 'To get details about a specific table, use the `table-details` tool:\n';
+                aiSchemaText += 'To get details about a specific table, use the `mcp_table_details` tool:\n';
                 aiSchemaText += '```javascript\n';
-                aiSchemaText += 'mcp__table_details({ tableName: "table_name" })\n';
+                aiSchemaText += 'mcp_table_details({ tableName: "schema_name.table_name" })\n';
+                aiSchemaText += '```\n\n';
+
+                aiSchemaText += '### Comprehensive Database Overview\n';
+                aiSchemaText += 'To get a broader overview of database objects, use the `mcp_discover_database_overview` tool:\n';
+                aiSchemaText += '```javascript\n';
+                aiSchemaText += 'mcp_discover_database_overview()\n';
                 aiSchemaText += '```\n\n';
                 
                 aiSchemaText += '## Best Practices for AI Assistants\n\n';
-                aiSchemaText += '1. Always check table existence before querying\n';
-                aiSchemaText += '2. Use `SELECT TOP N` for safety when exploring large tables\n';
-                aiSchemaText += '3. Explore table schema with `table-details` before constructing complex queries\n';
-                aiSchemaText += '4. Use `discover-database()` to get a comprehensive overview\n';
+                aiSchemaText += '1.  Always check table existence using `mcp_discover_tables` or `mcp_table_details` before querying if unsure.\n';
+                aiSchemaText += '2.  Use `SELECT TOP N` (e.g., `TOP 100`) for safety when exploring large tables for the first time.\n';
+                aiSchemaText += '3.  Explore table schema with `mcp_table_details` before constructing complex queries to understand columns and types.\n';
+                aiSchemaText += '4.  Use `mcp_discover_database_overview` or `mcp_discover_database` for a general understanding of available objects.\n';
+                aiSchemaText += '5.  When providing table names to tools, use schema qualification where appropriate (e.g., `dbo.MyTable`).\n';
                 
-                logger.info('AI-friendly schema generated');
+                logger.info('AI-friendly schema generated for ai_schema resource.');
                 
                 return {
                     contents: [{
@@ -587,34 +595,37 @@ function registerDiscoveryResource(server) {
                 
                 // Step 1: List all tables
                 discoveryText += '## Step 1: List All Tables\n\n';
-                discoveryText += 'To get a complete list of all tables in the database, use this command:\n\n';
+                discoveryText += 'To get a list of tables, you can use `mcp_discover_tables` or a direct query:\n\n';
                 discoveryText += '```javascript\n';
-                discoveryText += 'mcp__execute_query({ sql: "SELECT TOP 100 TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = \'BASE TABLE\' ORDER BY TABLE_SCHEMA, TABLE_NAME" })\n';
+                discoveryText += '// Option 1: Using the dedicated tool (recommended)\n';
+                discoveryText += 'mcp_discover_tables({ limit: 100, includeRowCounts: false })\n\n';
+                discoveryText += '// Option 2: Using a direct SQL query via mcp_execute_query\n';
+                discoveryText += 'mcp_execute_query({ sql: "SELECT TOP 100 TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = \'BASE TABLE\' ORDER BY TABLE_SCHEMA, TABLE_NAME" })\n';
                 discoveryText += '```\n\n';
                 
                 // Step 2: Explore table structure
                 discoveryText += '## Step 2: Explore Table Structure\n\n';
-                discoveryText += 'Once you have table names, explore their structure using either table-details or SQL:\n\n';
+                discoveryText += 'Once you have table names (e.g., `dbo.MyTable`), explore their structure:\n\n';
                 discoveryText += '```javascript\n';
-                discoveryText += '// Option 1: Using the dedicated tool\n';
+                discoveryText += '// Option 1: Using the dedicated mcp_table_details tool (recommended)\n';
                 if (sampleTablesWithRowCounts.length > 0) {
-                    discoveryText += `mcp__table_details({ tableName: "${sampleTablesWithRowCounts[0].name}" })\n\n`;
+                    discoveryText += `mcp_table_details({ tableName: "${sampleTablesWithRowCounts[0].schema}.${sampleTablesWithRowCounts[0].name}" })\n\n`;
                 } else {
-                    discoveryText += `mcp__table_details({ tableName: "example_table_name" })\n\n`;
+                    discoveryText += `mcp_table_details({ tableName: "schema.example_table_name" })\n\n`;
                 }
-                discoveryText += '// Option 2: Using SQL query\n';
-                discoveryText += 'mcp__execute_query({ sql: "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = \'example_table_name\' ORDER BY ORDINAL_POSITION" })\n';
+                discoveryText += '// Option 2: Using a direct SQL query via mcp_execute_query\n';
+                discoveryText += 'mcp_execute_query({ sql: "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = \'schema\' AND TABLE_NAME = \'example_table_name\' ORDER BY ORDINAL_POSITION" })\n';
                 discoveryText += '```\n\n';
                 
                 // Step 3: Query with example
                 discoveryText += '## Step 3: Execute Safe Queries\n\n';
-                discoveryText += 'After discovering tables and their structure, execute queries with TOP clause for safety:\n\n';
+                discoveryText += 'After discovering tables and their structure, execute queries with a `TOP` clause for safety:\n\n';
                 discoveryText += '```javascript\n';
-                discoveryText += `// Example query for a sample table\n`;
+                discoveryText += `// Example query for a sample table (replace with actual schema.table_name)\n`;
                 if (sampleTablesWithRowCounts.length > 0) {
-                    discoveryText += `mcp__execute_query({ sql: "SELECT TOP 100 * FROM [${sampleTablesWithRowCounts[0].schema}].[${sampleTablesWithRowCounts[0].name}]" })\n`;
+                    discoveryText += `mcp_execute_query({ sql: "SELECT TOP 10 * FROM [${sampleTablesWithRowCounts[0].schema}].[${sampleTablesWithRowCounts[0].name}]" })\n`;
                 } else {
-                    discoveryText += `mcp__execute_query({ sql: "SELECT TOP 100 * FROM [schema].[table_name]" })\n`;
+                    discoveryText += `mcp_execute_query({ sql: "SELECT TOP 10 * FROM [schema].[table_name]" })\n`;
                 }
                 discoveryText += '```\n\n';
                 

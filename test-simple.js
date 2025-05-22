@@ -17,7 +17,7 @@ async function main() {
         id: '123',
         method: 'tools/call',
         params: {
-          name: 'SQL_execute_query',
+          name: 'mcp_execute_query', // Updated name
           parameters: {
             sql: 'SELECT TOP 5 name FROM sys.tables'
           }

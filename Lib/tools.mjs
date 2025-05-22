@@ -1,4 +1,4 @@
-// lib/tools.js - Database tool implementations
+// lib/tools.mjs - Database tool implementations
 import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
@@ -7,12 +7,12 @@ import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { executeQuery, tableExists, sanitizeSqlIdentifier, formatSqlError } from './database.mjs';
 // Import new pagination utilities
-import { 
-    paginateQuery, 
-    generateNextCursor, 
-    generatePrevCursor, 
-    formatPaginationMetadata, 
-    extractDefaultCursorField 
+import {
+    paginateQuery,
+    generateNextCursor,
+    generatePrevCursor,
+    formatPaginationMetadata,
+    extractDefaultCursorField
 } from './pagination.mjs';
 import { logger } from './logger.mjs';
 import { createJsonRpcError } from './errors.mjs';
@@ -27,481 +27,472 @@ const __dirname = path.dirname(__filename);
 const QUERY_RESULTS_PATH = process.env.QUERY_RESULTS_PATH || path.join(__dirname, '../query_results');
 
 /**
+ * Registers a tool with the MCP server.
+ * Assumes server.tool() is the correct SDK method for registration.
+ * Logs success or failure.
+ * @param {object} server - MCP server instance.
+ * @param {string} name - The tool name (e.g., "mcp_execute_query").
+ * @param {object} schema - Zod schema for the tool's arguments.
+ * @param {function} handler - The async function to handle the tool's execution.
+ */
+function registerTool(server, name, schema, handler) {
+    try {
+        server.tool(name, schema, handler);
+        logger.info(`Registered tool: ${name}`);
+    } catch (err) {
+        logger.error(`Failed to register tool ${name}: ${err.message}`);
+    }
+}
+
+/**
  * Register all database tools
  * @param {object} server - MCP server instance
  */
 function registerDatabaseTools(server) {
     logger.info("Registering database tools...");
-    
-    // Make sure server._tools exists
-    if (!server._tools) {
-        server._tools = {};
-    }
-    
-    // Helper function to register tools with all name variants
-    const registerWithAllAliases = (name, schema, handler) => {
-        try {
-            // Register with mcp_ prefix
-            server.tool(`mcp_${name}`, schema, handler);
-            
-            // Register with mcp_SQL_ prefix for Claude client compatibility
-            server.tool(`mcp_SQL_${name}`, schema, handler);
-            
-            // Make sure server._tools exists
-            if (!server._tools) {
-                server._tools = {};
-            }
-            
-            // Also add directly to server._tools (since tool registration is not working)
-            server._tools[`mcp_${name}`] = { schema, handler };
-            server._tools[`mcp_SQL_${name}`] = { schema, handler };
-            
-            logger.info(`Registered tool: mcp_${name} and mcp_SQL_${name}`);
-        } catch (err) {
-            logger.error(`Failed to register tool ${name}: ${err.message}`);
-        }
-    };
-    
-    // Register all database tools
-    registerExecuteQueryTool(server, registerWithAllAliases);
-    registerTableDetailsTool(server, registerWithAllAliases);
-    registerProcedureDetailsTool(server, registerWithAllAliases);
-    registerFunctionDetailsTool(server, registerWithAllAliases);
-    registerViewDetailsTool(server, registerWithAllAliases);
-    registerIndexDetailsTool(server, registerWithAllAliases);
-    registerDiscoverTablesTool(server, registerWithAllAliases);
-    registerDiscoverDatabaseTool(server, registerWithAllAliases);
-    registerGetQueryResultsTool(server, registerWithAllAliases);
-    registerDiscoverTool(server, registerWithAllAliases);
-    registerCursorGuideTool(server, registerWithAllAliases);
-    registerPaginatedQueryTool(server, registerWithAllAliases);
-    registerQueryStreamerTool(server, registerWithAllAliases);
-    
-    // Log registered tools for debugging
-    logger.info(`Registered tools: ${Object.keys(server._tools).join(", ")}`);
+
+    // Register all database tools using the unified registration function
+    registerExecuteQueryTool(server);
+    registerTableDetailsTool(server);
+    registerProcedureDetailsTool(server);
+    registerFunctionDetailsTool(server);
+    registerViewDetailsTool(server);
+    registerIndexDetailsTool(server);
+    registerDiscoverTablesTool(server);
+    registerDiscoverDatabaseTool(server);
+    registerGetQueryResultsTool(server);
+    registerDiscoverDatabaseOverviewTool(server); // Renamed from registerDiscoverTool
+    registerPaginationGuideTool(server); // Renamed from registerCursorGuideTool
+    registerPaginatedQueryTool(server);
+    registerQueryStreamerTool(server);
+
+    // Note: Logging of all registered tools directly via server internals (server._tools) is removed
+    // as we rely on the SDK's registration method. If detailed listing is needed,
+    // the MCP SDK might offer a way to list registered tools.
+    logger.info("Database tools registration process completed.");
 }
 
 /**
- * Register the execute-query tool with pagination support
+ * Register the execute-query tool
  * @param {object} server - MCP server instance
- * @param {function} registerWithAllAliases - Helper to register with all name variants
  */
-function registerExecuteQueryTool(server, registerWithAllAliases) {
-    const schema = { 
+function registerExecuteQueryTool(server) {
+    const schema = {
             sql: z.string().min(1, "SQL query cannot be empty"),
-            returnResults: z.boolean().optional().default(false),
-            maxRows: z.number().min(1).max(10000).optional().default(1000),
+            // returnResults is deprecated as results are now always in the 'result' object. Kept for compatibility.
+            returnResults: z.boolean().optional().default(false).describe("Deprecated. Results are always in the 'result' object."),
+            maxRows: z.number().min(1).max(10000).optional().default(1000).describe("Max rows to return directly in results. Does not apply to saved results."),
             parameters: z.record(z.any()).optional(),
-            // Pagination parameters
-            pageSize: z.number().min(1).max(1000).optional(),
-            cursor: z.string().optional(),
-            cursorField: z.string().optional(),
-            includeCount: z.boolean().optional().default(false)
+            // The following pagination parameters are kept for potential backward compatibility
+            // but are not the primary way this tool handles pagination.
+            // For full pagination, use mcp_paginated_query.
+            pageSize: z.number().min(1).max(1000).optional().describe("For simple pagination, not recommended for large datasets."),
+            cursor: z.string().optional().describe("Cursor for simple pagination."),
+            cursorField: z.string().optional().describe("Cursor field for simple pagination."),
+            includeCount: z.boolean().optional().default(false).describe("Include total count for simple pagination.")
     };
-    
+
     const handler = async (args) => {
-        const { 
-            sql, 
-            returnResults = false, 
-            maxRows = 1000, 
+        const {
+            sql,
+            // returnResults is effectively ignored now.
+            maxRows = 1000, // This mainly applies if results are not being saved to a file but returned directly.
             parameters = {},
+            // Simple pagination args - consider deprecating or clarifying relation to mcp_paginated_query
             pageSize,
             cursor,
             cursorField,
             includeCount = false
         } = args;
-        
+
             // Basic validation to prevent destructive operations
             const lowerSql = sql.toLowerCase();
             const prohibitedOperations = ['drop ', 'delete ', 'truncate ', 'update ', 'alter '];
-            
+
             if (prohibitedOperations.some(op => lowerSql.includes(op))) {
                 return {
                     content: [{
                         type: "text",
                         text: "⚠️ Error: Data modification operations (DROP, DELETE, UPDATE, TRUNCATE, ALTER) are not allowed for safety reasons."
                     }],
-                    isError: true
+                    isError: true,
+                    error: createJsonRpcError(-32000, "Data modification operations are not allowed.")
                 };
             }
-            
+
             try {
-                // Extract potential table names from query for validation
-                const tableNameRegex = /\bfrom\s+(\[?[\w_.]+\]?)/gi;
-                const matches = [...lowerSql.matchAll(tableNameRegex)];
-                
-            // Variables for tracking
-                let totalCount = null;
-                
-            // Execute the query
-            logger.info(`Executing SQL: ${sql}`);
-            const startTime = Date.now();
-            const result = await executeQuery(sql, parameters);
-            const executionTime = Date.now() - startTime;
+                // Note: Validation for table existence or specific permissions before execution
+                // could be added here if necessary, based on `extractTableNames(sql)`.
+
+                let totalCountForSimplePagination = null;
+                let paginatedSql = sql;
+                let effectiveParams = { ...parameters };
+
+                // Basic pagination handling (if args provided)
+                // For robust pagination, mcp_paginated_query should be used.
+                if (pageSize && cursorField && !lowerSql.includes(" offset ") && !lowerSql.includes(" fetch ")) {
+                    logger.warn("Applying simple pagination to execute_query. For robust pagination, use mcp_paginated_query.");
+                    const { paginatedSql: tempSql, parameters: tempParams } = paginateQuery(sql, {
+                        cursorField,
+                        pageSize,
+                        cursor,
+                        parameters,
+                        defaultCursorField: cursorField // Assuming cursorField is explicitly given for this simple case
+                    });
+                    paginatedSql = tempSql;
+                    effectiveParams = tempParams;
+
+                    if (includeCount) {
+                        const countSql = `SELECT COUNT(*) AS TotalCount FROM (${sql.replace(/\s+ORDER\s+BY\s+.*/i, '')}) AS CountQuery`;
+                        const countResult = await executeQuery(countSql, parameters);
+                        totalCountForSimplePagination = countResult.recordset[0]?.TotalCount || 0;
+                    }
+                }
+
+
+                logger.info(`Executing SQL: ${paginatedSql}`);
+                const startTime = Date.now();
+                const result = await executeQuery(paginatedSql, effectiveParams, maxRows); // Pass maxRows to underlying executeQuery
+                const executionTime = Date.now() - startTime;
                 const rowCount = result.recordset?.length || 0;
-            logger.info(`SQL executed successfully in ${executionTime}ms, returned ${rowCount} rows`);
-            
-            // Format response for display
+                logger.info(`SQL executed successfully in ${executionTime}ms, returned ${rowCount} rows`);
+
                 let responseText = '';
-                
                 if (rowCount === 0) {
                     responseText = "Query executed successfully, but returned no rows.";
                 } else {
-                    // Basic result summary
-                responseText = `Query executed successfully in ${executionTime}ms and returned ${rowCount} rows.`;
-                    
-                    responseText += '\n\n';
-                    
-                    // Add sample of column names
+                    responseText = `Query executed successfully in ${executionTime}ms and returned ${rowCount} rows.`;
                     if (result.recordset && result.recordset.length > 0) {
-                        responseText += `Columns: ${Object.keys(result.recordset[0]).join(', ')}\n\n`;
+                        responseText += `\n\nColumns: ${Object.keys(result.recordset[0]).join(', ')}\n\n`;
+                        if (rowCount >= maxRows) {
+                            responseText += `Result potentially truncated to ${maxRows} rows. Use mcp_paginated_query or mcp_query_streamer for large results.\n\n`;
+                        }
                     }
-            }
-            
-            // Generate UUID for tracking
-            const uuid = crypto.randomUUID();
-            
-            // Return both the text response AND the actual data in MCP format
+                }
+
+                const uuid = crypto.randomUUID();
+                // TODO: Persist results associated with this UUID if they exceed a certain size or if returnResults=false
+                // For now, results are returned directly.
+
                 return {
                     content: [{
                         type: "text",
                         text: responseText
                     }],
-                result: {
-                    rowCount: rowCount,
-                    results: result.recordset || [],
-                    metadata: {
-                        uuid: uuid,
-                        pagination: null,
-                        totalCount: totalCount,
-                        executionTimeMs: executionTime
+                    result: {
+                        rowCount: rowCount,
+                        results: result.recordset || [], // Direct results up to maxRows
+                        metadata: {
+                            uuid: uuid, // UUID for this specific execution instance
+                            sql: sql, // Original SQL
+                            executionTimeMs: executionTime,
+                            // Basic pagination info if applied
+                            pagination: pageSize ? {
+                                pageSize: pageSize,
+                                cursor: cursor,
+                                cursorField: cursorField,
+                                totalCount: totalCountForSimplePagination
+                            } : null
                         }
                     }
                 };
             } catch (err) {
-            logger.error(`SQL execution failed: ${err.message}`);
-                
+                logger.error(`SQL execution failed: ${err.message}`);
                 return {
                     content: [{
                         type: "text",
                         text: `Error executing query: ${formatSqlError(err)}`
                     }],
-                    isError: true
+                    isError: true,
+                    error: createJsonRpcError(-32001, `SQL execution failed: ${formatSqlError(err)}`)
                 };
             }
     };
 
-    if (registerWithAllAliases) {
-        registerWithAllAliases("execute_query", schema, handler);
-                } else {
-        server.tool("execute_query", schema, handler);
-    }
+    registerTool(server, "mcp_execute_query", schema, handler);
 }
 
 /**
- * Register the table-details tool
+ * Register the table_details tool
  * @param {object} server - MCP server instance
- * @param {function} registerWithAllAliases - Helper to register with all name variants
  */
-function registerTableDetailsTool(server, registerWithAllAliases) {
-    const schema = { 
-        tableName: z.string().min(1, "Table name cannot be empty") 
+function registerTableDetailsTool(server) {
+    const schema = {
+        tableName: z.string().min(1, "Table name cannot be empty")
     };
-    
+
     const handler = async ({ tableName }) => {
         try {
             // Parse schema and table name
             let schemaName = 'dbo'; // Default schema
             let tableNameOnly = tableName;
-            
-            // Handle schema-qualified table names (schema.table)
+
             if (tableName.includes('.')) {
                 const parts = tableName.split('.');
-                schemaName = parts[0].replace(/[\[\]]/g, ''); // Remove any brackets
-                tableNameOnly = parts[1].replace(/[\[\]]/g, ''); // Remove any brackets
+                schemaName = parts[0].replace(/[\[\]]/g, '');
+                tableNameOnly = parts[1].replace(/[\[\]]/g, '');
             }
-            
-            // Sanitize table name components
+
             const sanitizedSchema = sanitizeSqlIdentifier(schemaName);
             const sanitizedTable = sanitizeSqlIdentifier(tableNameOnly);
-            
-            // Check if the sanitization changed anything
+
             if (sanitizedSchema !== schemaName || sanitizedTable !== tableNameOnly) {
                 return {
                     content: [{
                         type: "text",
-                        text: `Invalid table name components: ${tableName}. Table and schema names should only contain alphanumeric characters and underscores.`
+                        text: `Invalid table name components: ${tableName}. Table and schema names should only contain alphanumeric characters, underscores, and not start with numbers.`
                     }],
-                    isError: true
+                    isError: true,
+                    error: createJsonRpcError(-32602, "Invalid table name components.")
                 };
             }
-            
-            // Query for table details with schema qualification
-                const result = await executeQuery(`
-                    SELECT 
+
+            const result = await executeQuery(`
+                    SELECT
                         COLUMN_NAME,
                         DATA_TYPE,
                         CHARACTER_MAXIMUM_LENGTH,
                         IS_NULLABLE,
                         COLUMN_DEFAULT
-                    FROM 
+                    FROM
                         INFORMATION_SCHEMA.COLUMNS
-                    WHERE 
-                    TABLE_SCHEMA = @schemaName AND
+                    WHERE
+                        TABLE_SCHEMA = @schemaName AND
                         TABLE_NAME = @tableName
-                    ORDER BY 
+                    ORDER BY
                         ORDINAL_POSITION
-            `, { 
+            `, {
                 schemaName: sanitizedSchema,
                 tableName: sanitizedTable
             });
-                
+
                 if (result.recordset.length === 0) {
                     return {
                         content: [{
                             type: "text",
-                        text: `Table '${sanitizedSchema}.${sanitizedTable}' not found.`
+                            text: `Table '${sanitizedSchema}.${sanitizedTable}' not found.`
                         }],
-                        isError: true
+                        isError: true,
+                        error: createJsonRpcError(-32002, `Table '${sanitizedSchema}.${sanitizedTable}' not found.`)
                     };
                 }
-                
-            // Format response as markdown table
-            let markdown = `# Table: ${sanitizedSchema}.${sanitizedTable}\n\n`;
-            markdown += `## Columns\n\n`;
-            markdown += `| Column Name | Data Type | Max Length | Nullable | Default |\n`;
-            markdown += `|-------------|-----------|------------|----------|----------|\n`;
-            
-            result.recordset.forEach(column => {
-                markdown += `| ${column.COLUMN_NAME} | ${column.DATA_TYPE} | ${column.CHARACTER_MAXIMUM_LENGTH || 'N/A'} | ${column.IS_NULLABLE} | ${column.COLUMN_DEFAULT || 'NULL'} |\n`;
-            });
-            
-            // Return both the formatted markdown and the structured data
+
+                let markdown = `# Table: ${sanitizedSchema}.${sanitizedTable}\n\n`;
+                markdown += `## Columns\n\n`;
+                markdown += `| Column Name | Data Type | Max Length | Nullable | Default |\n`;
+                markdown += `|-------------|-----------|------------|----------|----------|\n`;
+
+                result.recordset.forEach(column => {
+                    markdown += `| ${column.COLUMN_NAME} | ${column.DATA_TYPE} | ${column.CHARACTER_MAXIMUM_LENGTH || 'N/A'} | ${column.IS_NULLABLE} | ${column.COLUMN_DEFAULT || 'NULL'} |\n`;
+                });
+
                 return {
                     content: [{
                         type: "text",
                         text: markdown
-                }],
-                result: {
-                    columns: result.recordset || [],
-                    metadata: {
-                        rowCount: result.recordset.length,
-                        tableName: `${sanitizedSchema}.${sanitizedTable}`
+                    }],
+                    result: {
+                        columns: result.recordset || [],
+                        metadata: {
+                            rowCount: result.recordset.length,
+                            tableName: `${sanitizedSchema}.${sanitizedTable}`
+                        }
                     }
-                }
                 };
             } catch (err) {
                 logger.error(`Error getting table details: ${err.message}`);
-                
                 return {
                     content: [{
                         type: "text",
                         text: `Error getting table details: ${formatSqlError(err)}`
                     }],
-                    isError: true
+                    isError: true,
+                    error: createJsonRpcError(-32001, `Error getting table details: ${formatSqlError(err)}`)
                 };
             }
     };
-    
-    if (registerWithAllAliases) {
-        registerWithAllAliases("table_details", schema, handler);
-    } else {
-        server.tool("table_details", schema, handler);
-    }
+    registerTool(server, "mcp_table_details", schema, handler);
 }
 
 /**
- * Register the procedure-details tool
+ * Register the procedure_details tool
  * @param {object} server - MCP server instance
- * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerProcedureDetailsTool(server, registerWithAlias) {
+function registerProcedureDetailsTool(server) {
+    const schema = {
+        procedureName: z.string().min(1, "Procedure name cannot be empty")
+    };
+
     const handler = async ({ procedureName }) => {
             try {
-                // Sanitize procedure name
                 const sanitizedProcName = sanitizeSqlIdentifier(procedureName);
-                
+
                 if (sanitizedProcName !== procedureName) {
                     return {
                         content: [{
                             type: "text",
                             text: `Invalid procedure name: ${procedureName}. Procedure names should only contain alphanumeric characters and underscores.`
                         }],
-                        isError: true
+                        isError: true,
+                        error: createJsonRpcError(-32602, "Invalid procedure name.")
                     };
                 }
-                
+
                 const result = await executeQuery(`
-                    SELECT 
+                    SELECT
                         ROUTINE_DEFINITION
-                    FROM 
+                    FROM
                         INFORMATION_SCHEMA.ROUTINES
-                    WHERE 
+                    WHERE
                         ROUTINE_TYPE = 'PROCEDURE' AND
                         ROUTINE_NAME = @procedureName
                 `, { procedureName: sanitizedProcName });
-                
+
                 if (result.recordset.length === 0) {
                     return {
                         content: [{
                             type: "text",
                             text: `Stored procedure '${sanitizedProcName}' not found.`
                         }],
-                        isError: true
+                        isError: true,
+                        error: createJsonRpcError(-32002, `Stored procedure '${sanitizedProcName}' not found.`)
                     };
                 }
-                
-                // Get parameters
+
                 const paramResult = await executeQuery(`
-                    SELECT 
+                    SELECT
                         PARAMETER_NAME,
                         DATA_TYPE,
                         PARAMETER_MODE
-                    FROM 
+                    FROM
                         INFORMATION_SCHEMA.PARAMETERS
-                    WHERE 
+                    WHERE
                         SPECIFIC_NAME = @procedureName
-                    ORDER BY 
+                    ORDER BY
                         ORDINAL_POSITION
                 `, { procedureName: sanitizedProcName });
-                
+
                 let markdown = `# Stored Procedure: ${sanitizedProcName}\n\n`;
-                
+
                 if (paramResult.recordset.length > 0) {
                     markdown += '## Parameters\n\n';
                     markdown += '| Name | Type | Mode |\n';
                     markdown += '|------|------|------|\n';
-                    
                     paramResult.recordset.forEach(param => {
                         markdown += `| ${param.PARAMETER_NAME} | ${param.DATA_TYPE} | ${param.PARAMETER_MODE} |\n`;
                     });
-                    
                     markdown += '\n';
                 }
-                
+
                 markdown += '## Definition\n\n';
                 markdown += '```sql\n';
                 markdown += result.recordset[0].ROUTINE_DEFINITION || 'Definition not available';
                 markdown += '\n```\n';
-                
+
                 return {
                     content: [{
                         type: "text",
                         text: markdown
-                }],
-                result: {
-                    procedureName: sanitizedProcName,
-                    parameters: paramResult.recordset || [],
-                    definition: result.recordset[0].ROUTINE_DEFINITION || 'Definition not available'
-                }
+                    }],
+                    result: {
+                        procedureName: sanitizedProcName,
+                        parameters: paramResult.recordset || [],
+                        definition: result.recordset[0].ROUTINE_DEFINITION || 'Definition not available'
+                    }
                 };
             } catch (err) {
                 logger.error(`Error getting procedure details: ${err.message}`);
-                
                 return {
                     content: [{
                         type: "text",
                         text: `Error getting procedure details: ${formatSqlError(err)}`
                     }],
-                    isError: true
+                    isError: true,
+                    error: createJsonRpcError(-32001, `Error getting procedure details: ${formatSqlError(err)}`)
                 };
             }
     };
-
-    const schema = { 
-        procedureName: z.string().min(1, "Procedure name cannot be empty") 
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("procedure_details", schema, handler);
-    } else {
-        server.tool("mcp_procedure_details", schema, handler);
-    }
+    registerTool(server, "mcp_procedure_details", schema, handler);
 }
 
 /**
- * Register the function-details tool
- * @param {object} server - MCP server instance 
- * @param {function} registerWithAlias - Optional helper to register with aliases
+ * Register the function_details tool
+ * @param {object} server - MCP server instance
  */
-function registerFunctionDetailsTool(server, registerWithAlias) {
+function registerFunctionDetailsTool(server) {
+    const schema = {
+        functionName: z.string().min(1, "Function name cannot be empty")
+    };
     const handler = async ({ functionName }) => {
             try {
-                // Sanitize function name
                 const sanitizedFuncName = sanitizeSqlIdentifier(functionName);
-                
+
                 if (sanitizedFuncName !== functionName) {
                     return {
                         content: [{
                             type: "text",
                             text: `Invalid function name: ${functionName}. Function names should only contain alphanumeric characters and underscores.`
                         }],
-                        isError: true
+                        isError: true,
+                        error: createJsonRpcError(-32602, "Invalid function name.")
                     };
                 }
-                
+
                 const result = await executeQuery(`
-                    SELECT 
+                    SELECT
                         ROUTINE_DEFINITION,
                         DATA_TYPE AS RETURN_TYPE
-                    FROM 
+                    FROM
                         INFORMATION_SCHEMA.ROUTINES
-                    WHERE 
+                    WHERE
                         ROUTINE_TYPE = 'FUNCTION' AND
                         ROUTINE_NAME = @functionName
                 `, { functionName: sanitizedFuncName });
-                
+
                 if (result.recordset.length === 0) {
                     return {
                         content: [{
                             type: "text",
                             text: `Function '${sanitizedFuncName}' not found.`
                         }],
-                        isError: true
+                        isError: true,
+                        error: createJsonRpcError(-32002, `Function '${sanitizedFuncName}' not found.`)
                     };
                 }
-                
-                // Get parameters
+
                 const paramResult = await executeQuery(`
-                    SELECT 
+                    SELECT
                         PARAMETER_NAME,
                         DATA_TYPE,
                         PARAMETER_MODE
-                    FROM 
+                    FROM
                         INFORMATION_SCHEMA.PARAMETERS
-                    WHERE 
+                    WHERE
                         SPECIFIC_NAME = @functionName
-                    ORDER BY 
+                    ORDER BY
                         ORDINAL_POSITION
                 `, { functionName: sanitizedFuncName });
-                
+
                 let markdown = `# Function: ${sanitizedFuncName}\n\n`;
-                
-                // Add return type
                 markdown += `**Return Type**: ${result.recordset[0].RETURN_TYPE || 'Unknown'}\n\n`;
-                
+
                 if (paramResult.recordset.length > 0) {
                     markdown += '## Parameters\n\n';
                     markdown += '| Name | Type | Mode |\n';
                     markdown += '|------|------|------|\n';
-                    
                     paramResult.recordset.forEach(param => {
                         markdown += `| ${param.PARAMETER_NAME} | ${param.DATA_TYPE} | ${param.PARAMETER_MODE} |\n`;
                     });
-                    
                     markdown += '\n';
                 }
-                
+
                 markdown += '## Definition\n\n';
                 markdown += '```sql\n';
                 markdown += result.recordset[0].ROUTINE_DEFINITION || 'Definition not available';
                 markdown += '\n```\n';
-                
-                // Add usage example
+
                 markdown += '\n## Usage Example\n\n';
                 markdown += '```sql\n';
-                
-                // Simple scalar function example
                 if (paramResult.recordset.length === 0) {
                     markdown += `-- Call scalar function\n`;
                     markdown += `SELECT dbo.${sanitizedFuncName}() AS Result\n`;
@@ -509,184 +500,167 @@ function registerFunctionDetailsTool(server, registerWithAlias) {
                     markdown += `-- Call function with parameters\n`;
                     markdown += `SELECT dbo.${sanitizedFuncName}(${paramResult.recordset.map(() => '?').join(', ')}) AS Result\n`;
                 }
-                
                 markdown += '```\n';
-                
+
                 return {
                     content: [{
                         type: "text",
                         text: markdown
-                }],
-                result: {
-                    functionName: sanitizedFuncName,
-                    returnType: result.recordset[0].RETURN_TYPE || 'Unknown',
-                    parameters: paramResult.recordset || [],
-                    definition: result.recordset[0].ROUTINE_DEFINITION || 'Definition not available'
-                }
+                    }],
+                    result: {
+                        functionName: sanitizedFuncName,
+                        returnType: result.recordset[0].RETURN_TYPE || 'Unknown',
+                        parameters: paramResult.recordset || [],
+                        definition: result.recordset[0].ROUTINE_DEFINITION || 'Definition not available'
+                    }
                 };
             } catch (err) {
                 logger.error(`Error getting function details: ${err.message}`);
-                
                 return {
                     content: [{
                         type: "text",
                         text: `Error getting function details: ${formatSqlError(err)}`
                     }],
-                    isError: true
+                    isError: true,
+                    error: createJsonRpcError(-32001, `Error getting function details: ${formatSqlError(err)}`)
                 };
             }
     };
-
-    const schema = { 
-        functionName: z.string().min(1, "Function name cannot be empty") 
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("function_details", schema, handler);
-    } else {
-        server.tool("mcp_function_details", schema, handler);
-    }
+    registerTool(server, "mcp_function_details", schema, handler);
 }
 
 /**
- * Register the view-details tool
+ * Register the view_details tool
  * @param {object} server - MCP server instance
- * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerViewDetailsTool(server, registerWithAlias) {
+function registerViewDetailsTool(server) {
+    const schema = {
+        viewName: z.string().min(1, "View name cannot be empty")
+    };
     const handler = async ({ viewName }) => {
             try {
-                // Sanitize view name
                 const sanitizedViewName = sanitizeSqlIdentifier(viewName);
-                
+
                 if (sanitizedViewName !== viewName) {
                     return {
                         content: [{
                             type: "text",
                             text: `Invalid view name: ${viewName}. View names should only contain alphanumeric characters and underscores.`
                         }],
-                        isError: true
+                        isError: true,
+                        error: createJsonRpcError(-32602, "Invalid view name.")
                     };
                 }
-                
+
                 const result = await executeQuery(`
-                    SELECT 
+                    SELECT
                         VIEW_DEFINITION
-                    FROM 
+                    FROM
                         INFORMATION_SCHEMA.VIEWS
-                    WHERE 
+                    WHERE
                         TABLE_NAME = @viewName
                 `, { viewName: sanitizedViewName });
-                
+
                 if (result.recordset.length === 0) {
                     return {
                         content: [{
                             type: "text",
                             text: `View '${sanitizedViewName}' not found.`
                         }],
-                        isError: true
+                        isError: true,
+                        error: createJsonRpcError(-32002, `View '${sanitizedViewName}' not found.`)
                     };
                 }
-                
-                // Get columns
+
                 const columnResult = await executeQuery(`
-                    SELECT 
+                    SELECT
                         COLUMN_NAME,
                         DATA_TYPE,
                         IS_NULLABLE
-                    FROM 
+                    FROM
                         INFORMATION_SCHEMA.COLUMNS
-                    WHERE 
+                    WHERE
                         TABLE_NAME = @viewName
-                    ORDER BY 
+                    ORDER BY
                         ORDINAL_POSITION
                 `, { viewName: sanitizedViewName });
-                
+
                 let markdown = `# View: ${sanitizedViewName}\n\n`;
-                
+
                 if (columnResult.recordset.length > 0) {
                     markdown += '## Columns\n\n';
                     markdown += '| Name | Type | Nullable |\n';
                     markdown += '|------|------|----------|\n';
-                    
                     columnResult.recordset.forEach(col => {
                         markdown += `| ${col.COLUMN_NAME} | ${col.DATA_TYPE} | ${col.IS_NULLABLE} |\n`;
                     });
-                    
                     markdown += '\n';
                 }
-                
+
                 markdown += '## Definition\n\n';
                 markdown += '```sql\n';
                 markdown += result.recordset[0].VIEW_DEFINITION || 'Definition not available';
                 markdown += '\n```\n';
-                
-                // Add usage example
+
                 markdown += '\n## Usage Example\n\n';
                 markdown += '```sql\n';
                 markdown += `-- Query the view\n`;
                 markdown += `SELECT TOP 100 * FROM [${sanitizedViewName}]\n`;
                 markdown += '```\n';
-                
+
                 return {
                     content: [{
                         type: "text",
                         text: markdown
-                }],
-                result: {
-                    viewName: sanitizedViewName,
-                    columns: columnResult.recordset || [],
-                    definition: result.recordset[0].VIEW_DEFINITION || 'Definition not available'
-                }
+                    }],
+                    result: {
+                        viewName: sanitizedViewName,
+                        columns: columnResult.recordset || [],
+                        definition: result.recordset[0].VIEW_DEFINITION || 'Definition not available'
+                    }
                 };
             } catch (err) {
                 logger.error(`Error getting view details: ${err.message}`);
-                
                 return {
                     content: [{
                         type: "text",
                         text: `Error getting view details: ${formatSqlError(err)}`
                     }],
-                    isError: true
+                    isError: true,
+                    error: createJsonRpcError(-32001, `Error getting view details: ${formatSqlError(err)}`)
                 };
             }
     };
-
-    const schema = { 
-        viewName: z.string().min(1, "View name cannot be empty") 
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("view_details", schema, handler);
-    } else {
-        server.tool("mcp_view_details", schema, handler);
-    }
+    registerTool(server, "mcp_view_details", schema, handler);
 }
 
 /**
- * Register the index-details tool
+ * Register the index_details tool
  * @param {object} server - MCP server instance
- * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerIndexDetailsTool(server, registerWithAlias) {
+function registerIndexDetailsTool(server) {
+    const schema = {
+        tableName: z.string().min(1, "Table name cannot be empty"),
+        indexName: z.string().min(1, "Index name cannot be empty")
+    };
     const handler = async ({ tableName, indexName }) => {
             try {
-                // Sanitize names
                 const sanitizedTableName = sanitizeSqlIdentifier(tableName);
                 const sanitizedIndexName = sanitizeSqlIdentifier(indexName);
-                
+
                 if (sanitizedTableName !== tableName || sanitizedIndexName !== indexName) {
                     return {
                         content: [{
                             type: "text",
                             text: `Invalid table or index name. Names should only contain alphanumeric characters and underscores.`
                         }],
-                        isError: true
+                        isError: true,
+                        error: createJsonRpcError(-32602, "Invalid table or index name.")
                     };
                 }
-                
+
                 const result = await executeQuery(`
-                    SELECT 
+                    SELECT
                         i.name AS IndexName,
                         i.type_desc AS IndexType,
                         i.is_unique AS IsUnique,
@@ -695,64 +669,61 @@ function registerIndexDetailsTool(server, registerWithAlias) {
                         c.name AS ColumnName,
                         ic.is_descending_key AS IsDescending,
                         ic.is_included_column AS IsIncluded
-                    FROM 
+                    FROM
                         sys.indexes i
-                    INNER JOIN 
+                    INNER JOIN
                         sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-                    INNER JOIN 
+                    INNER JOIN
                         sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-                    INNER JOIN 
+                    INNER JOIN
                         sys.tables t ON i.object_id = t.object_id
-                    WHERE 
+                    WHERE
                         t.name = @tableName AND
                         i.name = @indexName
-                    ORDER BY 
+                    ORDER BY
                         ic.key_ordinal
-                `, { 
-                    tableName: sanitizedTableName, 
-                    indexName: sanitizedIndexName 
+                `, {
+                    tableName: sanitizedTableName,
+                    indexName: sanitizedIndexName
                 });
-                
+
                 if (result.recordset.length === 0) {
                     return {
                         content: [{
                             type: "text",
                             text: `Index '${sanitizedIndexName}' on table '${sanitizedTableName}' not found.`
                         }],
-                        isError: true
+                        isError: true,
+                        error: createJsonRpcError(-32002, `Index '${sanitizedIndexName}' on table '${sanitizedTableName}' not found.`)
                     };
                 }
-                
+
                 let markdown = `# Index: ${sanitizedIndexName}\n\n`;
                 markdown += `**Table**: ${sanitizedTableName}\n\n`;
                 markdown += `**Type**: ${result.recordset[0].IndexType}\n\n`;
                 markdown += `**Unique**: ${result.recordset[0].IsUnique ? 'Yes' : 'No'}\n\n`;
                 markdown += `**Primary Key**: ${result.recordset[0].IsPrimaryKey ? 'Yes' : 'No'}\n\n`;
                 markdown += `**Unique Constraint**: ${result.recordset[0].IsUniqueConstraint ? 'Yes' : 'No'}\n\n`;
-                
-                // Split into key columns and included columns
+
                 const keyColumns = result.recordset.filter(r => !r.IsIncluded);
                 const includedColumns = result.recordset.filter(r => r.IsIncluded);
-                
+
                 markdown += '## Key Columns\n\n';
                 markdown += '| Column | Sort Direction |\n';
                 markdown += '|--------|---------------|\n';
-                
                 keyColumns.forEach(col => {
                     markdown += `| ${col.ColumnName} | ${col.IsDescending ? 'Descending' : 'Ascending'} |\n`;
                 });
-                
+
                 if (includedColumns.length > 0) {
                     markdown += '\n## Included Columns\n\n';
                     markdown += '| Column |\n';
                     markdown += '|--------|\n';
-                    
                     includedColumns.forEach(col => {
                         markdown += `| ${col.ColumnName} |\n`;
                     });
                 }
-                
-                // Add index usage query example
+
                 markdown += '\n## Index Usage Query\n\n';
                 markdown += '```sql\n';
                 markdown += `-- Get index usage statistics\n`;
@@ -780,545 +751,330 @@ function registerIndexDetailsTool(server, registerWithAlias) {
                 markdown += `    t.name = '${sanitizedTableName}'\n`;
                 markdown += `    AND i.name = '${sanitizedIndexName}'\n`;
                 markdown += '```\n';
-                
+
                 return {
                     content: [{
                         type: "text",
                         text: markdown
-                }],
-                result: {
-                    tableName: sanitizedTableName,
-                    indexName: sanitizedIndexName,
-                    type: result.recordset[0].IndexType,
-                    isUnique: result.recordset[0].IsUnique,
-                    isPrimaryKey: result.recordset[0].IsPrimaryKey,
-                    isUniqueConstraint: result.recordset[0].IsUniqueConstraint,
-                    keyColumns: keyColumns.map(col => col.ColumnName),
-                    includedColumns: includedColumns.map(col => col.ColumnName)
-                }
+                    }],
+                    result: {
+                        tableName: sanitizedTableName,
+                        indexName: sanitizedIndexName,
+                        type: result.recordset[0].IndexType,
+                        isUnique: result.recordset[0].IsUnique,
+                        isPrimaryKey: result.recordset[0].IsPrimaryKey,
+                        isUniqueConstraint: result.recordset[0].IsUniqueConstraint,
+                        keyColumns: keyColumns.map(col => col.ColumnName),
+                        includedColumns: includedColumns.map(col => col.ColumnName)
+                    }
                 };
             } catch (err) {
                 logger.error(`Error getting index details: ${err.message}`);
-                
                 return {
                     content: [{
                         type: "text",
                         text: `Error getting index details: ${formatSqlError(err)}`
                     }],
-                    isError: true
+                    isError: true,
+                    error: createJsonRpcError(-32001, `Error getting index details: ${formatSqlError(err)}`)
                 };
             }
     };
-
-    const schema = { 
-        tableName: z.string().min(1, "Table name cannot be empty"),
-        indexName: z.string().min(1, "Index name cannot be empty")
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("index_details", schema, handler);
-    } else {
-        server.tool("mcp_index_details", schema, handler);
-    }
+    registerTool(server, "mcp_index_details", schema, handler);
 }
 
 /**
- * Register the discover-tables tool
- * @param {object} server - MCP server instance 
- * @param {function} registerWithAlias - Optional helper to register with aliases
+ * Register the discover_tables tool
+ * @param {object} server - MCP server instance
  */
-function registerDiscoverTablesTool(server, registerWithAlias) {
+function registerDiscoverTablesTool(server) {
+    const schema = {
+        namePattern: z.string().optional().default('%'),
+        limit: z.number().min(1).max(1000).optional().default(100),
+        includeRowCounts: z.boolean().optional().default(false)
+    };
     const handler = async ({ namePattern = '%', limit = 100, includeRowCounts = false }) => {
             try {
-                // Sanitize name pattern - at least allow wildcards
                 const sanitizedPattern = namePattern.replace(/[^a-zA-Z0-9_%]/g, '');
-                
-                // Build query based on parameters
                 let query = `
                     SELECT TOP ${limit}
                         TABLE_SCHEMA,
                         TABLE_NAME,
                         TABLE_TYPE
-                    FROM 
+                    FROM
                         INFORMATION_SCHEMA.TABLES
-                    WHERE 
+                    WHERE
                         TABLE_TYPE = 'BASE TABLE'
                 `;
-                
-                // Add name pattern filter if provided and not the default wildcard
                 if (sanitizedPattern !== '%') {
                     query += ` AND TABLE_NAME LIKE @namePattern`;
                 }
-                
-                // Add order
                 query += ` ORDER BY TABLE_SCHEMA, TABLE_NAME`;
-                
+
                 const result = await executeQuery(query, { namePattern: sanitizedPattern });
-                
+
                 if (result.recordset.length === 0) {
                     return {
                         content: [{
                             type: "text",
                             text: `No tables found${sanitizedPattern !== '%' ? ` matching pattern '${sanitizedPattern}'` : ''}.`
-                        }]
+                        }],
+                        result: { tables: [], rowCounts: [] } // Ensure result object is present
                     };
                 }
-                
-                // Format results as markdown
+
                 let markdown = `# Database Tables${sanitizedPattern !== '%' ? ` Matching '${sanitizedPattern}'` : ''}\n\n`;
                 markdown += `Found ${result.recordset.length} tables.\n\n`;
-                
-                // If row counts are requested, get them for each table
-                let tableWithRowCounts = [];
-                
+                let tableData = result.recordset;
+
                 if (includeRowCounts) {
-                    // For large number of tables, row counts could be expensive
-                    // Limit to first 20 tables
-                    const tablesToCount = result.recordset.slice(0, 20);
-                    
-                    for (const table of tablesToCount) {
+                    const tablesToCount = result.recordset.slice(0, 20); // Limit row counts for performance
+                    const countedTableData = await Promise.all(tablesToCount.map(async (table) => {
                         try {
                             const countResult = await executeQuery(`
-                                SELECT 
-                                    SUM(p.rows) AS [RowCount]
-                                FROM 
-                                    sys.partitions p
-                                INNER JOIN 
-                                    sys.tables t ON p.object_id = t.object_id
-                                INNER JOIN 
-                                    sys.schemas s ON t.schema_id = s.schema_id
-                                WHERE 
-                                    s.name = @schemaName
-                                    AND t.name = @tableName
-                                    AND p.index_id IN (0, 1)
-                            `, { 
-                                schemaName: table.TABLE_SCHEMA,
-                                tableName: table.TABLE_NAME
-                            });
-                            
-                            tableWithRowCounts.push({
-                                ...table,
-                                RowCount: countResult.recordset[0].RowCount || 0
-                            });
+                                SELECT SUM(p.rows) AS [RowCount]
+                                FROM sys.partitions p
+                                INNER JOIN sys.tables t ON p.object_id = t.object_id
+                                INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                                WHERE s.name = @schemaName AND t.name = @tableName AND p.index_id IN (0, 1)
+                            `, { schemaName: table.TABLE_SCHEMA, tableName: table.TABLE_NAME });
+                            return { ...table, RowCount: countResult.recordset[0]?.RowCount || 0 };
                         } catch (err) {
                             logger.warn(`Error getting row count for ${table.TABLE_SCHEMA}.${table.TABLE_NAME}: ${err.message}`);
-                            tableWithRowCounts.push({
-                                ...table,
-                                RowCount: 'Error'
-                            });
+                            return { ...table, RowCount: 'Error' };
                         }
-                    }
-                    
-                    // Add the remaining tables without row counts if any
-                    if (result.recordset.length > 20) {
-                        for (let i = 20; i < result.recordset.length; i++) {
-                            tableWithRowCounts.push({
-                                ...result.recordset[i],
-                                RowCount: 'Not calculated'
-                            });
-                        }
-                    }
-                    
-                    // Create table with row counts
+                    }));
+                    // Merge back with non-counted tables if limit was > 20
+                    tableData = countedTableData.concat(result.recordset.slice(20).map(t => ({...t, RowCount: 'Not Calculated'})));
+
                     markdown += '| Schema | Table Name | Row Count |\n';
                     markdown += '|--------|------------|----------|\n';
-                    
-                    tableWithRowCounts.forEach(table => {
+                    tableData.forEach(table => {
                         markdown += `| ${table.TABLE_SCHEMA} | ${table.TABLE_NAME} | ${table.RowCount} |\n`;
                     });
                 } else {
-                    // Just schema and table name
                     markdown += '| Schema | Table Name |\n';
                     markdown += '|--------|------------|\n';
-                    
-                    result.recordset.forEach(table => {
+                    tableData.forEach(table => {
                         markdown += `| ${table.TABLE_SCHEMA} | ${table.TABLE_NAME} |\n`;
                     });
                 }
-                
+
                 markdown += '\n## Next Steps\n\n';
                 markdown += '1. To view a table\'s structure, use:\n';
                 markdown += '```javascript\n';
-                markdown += `mcp__table_details({ tableName: "${result.recordset[0].TABLE_NAME}" })\n`;
+                markdown += `mcp_table_details({ tableName: "${result.recordset[0].TABLE_SCHEMA}.${result.recordset[0].TABLE_NAME}" })\n`;
                 markdown += '```\n\n';
-                
                 markdown += '2. To query a table, use:\n';
                 markdown += '```javascript\n';
-                markdown += `mcp__execute_query({ sql: "SELECT TOP 100 * FROM [${result.recordset[0].TABLE_SCHEMA}].[${result.recordset[0].TABLE_NAME}]" })\n`;
+                markdown += `mcp_execute_query({ sql: "SELECT TOP 100 * FROM [${result.recordset[0].TABLE_SCHEMA}].[${result.recordset[0].TABLE_NAME}]" })\n`;
                 markdown += '```\n\n';
-                
                 if (sanitizedPattern === '%') {
                     markdown += '3. To find tables by name pattern, use:\n';
                     markdown += '```javascript\n';
-                    markdown += `mcp__discover_tables({ namePattern: "%search_term%" })\n`;
+                    markdown += `mcp_discover_tables({ namePattern: "%search_term%" })\n`;
                     markdown += '```\n\n';
                 }
-                
                 if (!includeRowCounts) {
                     markdown += '4. To include row counts (may be slower for many tables):\n';
                     markdown += '```javascript\n';
-                    markdown += `mcp__discover_tables({ namePattern: "${sanitizedPattern}", includeRowCounts: true })\n`;
+                    markdown += `mcp_discover_tables({ namePattern: "${sanitizedPattern}", includeRowCounts: true })\n`;
                     markdown += '```\n';
                 }
-                
+
                 return {
-                    content: [{
-                        type: "text",
-                        text: markdown
-                }],
-                result: {
-                    tables: result.recordset || [],
-                    rowCounts: tableWithRowCounts
-                }
+                    content: [{ type: "text", text: markdown }],
+                    result: { tables: tableData } // tableData includes row counts if requested
                 };
             } catch (err) {
                 logger.error(`Error discovering tables: ${err.message}`);
-                
                 return {
-                    content: [{
-                        type: "text",
-                        text: `Error discovering tables: ${formatSqlError(err)}`
-                    }],
-                    isError: true
+                    content: [{ type: "text", text: `Error discovering tables: ${formatSqlError(err)}` }],
+                    isError: true,
+                    error: createJsonRpcError(-32001, `Error discovering tables: ${formatSqlError(err)}`)
                 };
             }
     };
-
-    const schema = { 
-        namePattern: z.string().optional().default('%'),
-        limit: z.number().min(1).max(1000).optional().default(100),
-        includeRowCounts: z.boolean().optional().default(false)
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("discover_tables", schema, handler);
-    } else {
-        server.tool("mcp_discover_tables", schema, handler);
-    }
+    registerTool(server, "mcp_discover_tables", schema, handler);
 }
 
 /**
- * Register the discover-database tool
+ * Register the discover_database tool
  * @param {object} server - MCP server instance
- * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerDiscoverDatabaseTool(server, registerWithAlias) {
+function registerDiscoverDatabaseTool(server) {
+    const schema = {
+        type: z.enum(['tables', 'views', 'procedures', 'functions', 'all']).default('all'),
+        limit: z.number().min(1).max(1000).optional().default(100)
+    };
     const handler = async ({ type = 'all', limit = 100 }) => {
             try {
                 let markdown = `# SQL Server Database Discovery\n\n`;
-                
-                // Discover tables
+                const discoveryResult = {
+                    tables: [],
+                    views: [],
+                    procedures: [],
+                    functions: []
+                };
+
                 if (type === 'tables' || type === 'all') {
                     const tablesQuery = `
-                        SELECT TOP ${limit}
-                            TABLE_SCHEMA,
-                            TABLE_NAME
-                        FROM 
-                            INFORMATION_SCHEMA.TABLES
-                        WHERE 
-                            TABLE_TYPE = 'BASE TABLE'
-                        ORDER BY 
-                            TABLE_SCHEMA, TABLE_NAME
-                    `;
-                    
+                        SELECT TOP ${limit} TABLE_SCHEMA, TABLE_NAME
+                        FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'
+                        ORDER BY TABLE_SCHEMA, TABLE_NAME`;
                     const tablesResult = await executeQuery(tablesQuery);
-                    
-                    markdown += `## Tables (${tablesResult.recordset.length})\n\n`;
-                    
-                    if (tablesResult.recordset.length > 0) {
-                        markdown += '| Schema | Table Name |\n';
-                        markdown += '|--------|------------|\n';
-                        
-                        tablesResult.recordset.forEach(table => {
-                            markdown += `| ${table.TABLE_SCHEMA} | ${table.TABLE_NAME} |\n`;
-                        });
-                        
-                        markdown += '\n### Example Query:\n';
-                        markdown += '```sql\n';
-                        markdown += `-- Get sample data from a table\n`;
-                        markdown += `SELECT TOP 100 * FROM [${tablesResult.recordset[0].TABLE_SCHEMA}].[${tablesResult.recordset[0].TABLE_NAME}]\n`;
-                        markdown += '```\n\n';
+                    discoveryResult.tables = tablesResult.recordset || [];
+                    markdown += `## Tables (${discoveryResult.tables.length})\n\n`;
+                    if (discoveryResult.tables.length > 0) {
+                        markdown += '| Schema | Table Name |\n|--------|------------|\n';
+                        discoveryResult.tables.forEach(t => markdown += `| ${t.TABLE_SCHEMA} | ${t.TABLE_NAME} |\n`);
+                        markdown += `\n### Example Query:\n\`\`\`sql\nSELECT TOP 100 * FROM [${discoveryResult.tables[0].TABLE_SCHEMA}].[${discoveryResult.tables[0].TABLE_NAME}]\n\`\`\`\n\n`;
                     } else {
                         markdown += 'No tables found.\n\n';
                     }
                 }
-                
-                // Discover views
+
                 if (type === 'views' || type === 'all') {
                     const viewsQuery = `
-                        SELECT TOP ${limit}
-                            TABLE_SCHEMA,
-                            TABLE_NAME
-                        FROM 
-                            INFORMATION_SCHEMA.VIEWS
-                        ORDER BY 
-                            TABLE_SCHEMA, TABLE_NAME
-                    `;
-                    
+                        SELECT TOP ${limit} TABLE_SCHEMA, TABLE_NAME
+                        FROM INFORMATION_SCHEMA.VIEWS ORDER BY TABLE_SCHEMA, TABLE_NAME`;
                     const viewsResult = await executeQuery(viewsQuery);
-                    
-                    markdown += `## Views (${viewsResult.recordset.length})\n\n`;
-                    
-                    if (viewsResult.recordset.length > 0) {
-                        markdown += '| Schema | View Name |\n';
-                        markdown += '|--------|----------|\n';
-                        
-                        viewsResult.recordset.forEach(view => {
-                            markdown += `| ${view.TABLE_SCHEMA} | ${view.TABLE_NAME} |\n`;
-                        });
-                        
-                        markdown += '\n### Example Query:\n';
-                        markdown += '```sql\n';
-                        if (viewsResult.recordset.length > 0) {
-                            markdown += `-- Get data from a view\n`;
-                            markdown += `SELECT TOP 100 * FROM [${viewsResult.recordset[0].TABLE_SCHEMA}].[${viewsResult.recordset[0].TABLE_NAME}]\n`;
-                        }
-                        markdown += '```\n\n';
+                    discoveryResult.views = viewsResult.recordset || [];
+                    markdown += `## Views (${discoveryResult.views.length})\n\n`;
+                    if (discoveryResult.views.length > 0) {
+                        markdown += '| Schema | View Name |\n|--------|----------|\n';
+                        discoveryResult.views.forEach(v => markdown += `| ${v.TABLE_SCHEMA} | ${v.TABLE_NAME} |\n`);
+                        markdown += `\n### Example Query:\n\`\`\`sql\nSELECT TOP 100 * FROM [${discoveryResult.views[0].TABLE_SCHEMA}].[${discoveryResult.views[0].TABLE_NAME}]\n\`\`\`\n\n`;
                     } else {
                         markdown += 'No views found.\n\n';
                     }
                 }
-                
-                // Discover stored procedures
+
                 if (type === 'procedures' || type === 'all') {
                     const procsQuery = `
-                        SELECT TOP ${limit}
-                            ROUTINE_SCHEMA,
-                            ROUTINE_NAME
-                        FROM 
-                            INFORMATION_SCHEMA.ROUTINES
-                        WHERE 
-                            ROUTINE_TYPE = 'PROCEDURE'
-                        ORDER BY 
-                            ROUTINE_SCHEMA, ROUTINE_NAME
-                    `;
-                    
+                        SELECT TOP ${limit} ROUTINE_SCHEMA, ROUTINE_NAME
+                        FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_TYPE = 'PROCEDURE'
+                        ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME`;
                     const procsResult = await executeQuery(procsQuery);
-                    
-                    markdown += `## Stored Procedures (${procsResult.recordset.length})\n\n`;
-                    
-                    if (procsResult.recordset.length > 0) {
-                        markdown += '| Schema | Procedure Name |\n';
-                        markdown += '|--------|---------------|\n';
-                        
-                        procsResult.recordset.forEach(proc => {
-                            markdown += `| ${proc.ROUTINE_SCHEMA} | ${proc.ROUTINE_NAME} |\n`;
-                        });
-                        
-                        markdown += '\n### Example:\n';
-                        markdown += '```sql\n';
-                        if (procsResult.recordset.length > 0) {
-                            markdown += `-- Get procedure definition\n`;
-                            markdown += `EXEC sp_helptext '${procsResult.recordset[0].ROUTINE_SCHEMA}.${procsResult.recordset[0].ROUTINE_NAME}'\n`;
-                        }
-                        markdown += '```\n\n';
+                    discoveryResult.procedures = procsResult.recordset || [];
+                    markdown += `## Stored Procedures (${discoveryResult.procedures.length})\n\n`;
+                    if (discoveryResult.procedures.length > 0) {
+                        markdown += '| Schema | Procedure Name |\n|--------|---------------|\n';
+                        discoveryResult.procedures.forEach(p => markdown += `| ${p.ROUTINE_SCHEMA} | ${p.ROUTINE_NAME} |\n`);
+                        markdown += `\n### Example:\n\`\`\`sql\nEXEC sp_helptext '${discoveryResult.procedures[0].ROUTINE_SCHEMA}.${discoveryResult.procedures[0].ROUTINE_NAME}'\n\`\`\`\n\n`;
                     } else {
                         markdown += 'No stored procedures found.\n\n';
                     }
                 }
-                
-                // Discover functions
+
                 if (type === 'functions' || type === 'all') {
                     const funcsQuery = `
-                        SELECT TOP ${limit}
-                            ROUTINE_SCHEMA,
-                            ROUTINE_NAME
-                        FROM 
-                            INFORMATION_SCHEMA.ROUTINES
-                        WHERE 
-                            ROUTINE_TYPE = 'FUNCTION'
-                        ORDER BY 
-                            ROUTINE_SCHEMA, ROUTINE_NAME
-                    `;
-                    
+                        SELECT TOP ${limit} ROUTINE_SCHEMA, ROUTINE_NAME
+                        FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_TYPE = 'FUNCTION'
+                        ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME`;
                     const funcsResult = await executeQuery(funcsQuery);
-                    
-                    markdown += `## Functions (${funcsResult.recordset.length})\n\n`;
-                    
-                    if (funcsResult.recordset.length > 0) {
-                        markdown += '| Schema | Function Name |\n';
-                        markdown += '|--------|---------------|\n';
-                        
-                        funcsResult.recordset.forEach(func => {
-                            markdown += `| ${func.ROUTINE_SCHEMA} | ${func.ROUTINE_NAME} |\n`;
-                        });
-                        
-                        markdown += '\n### Example:\n';
-                        markdown += '```sql\n';
-                        if (funcsResult.recordset.length > 0) {
-                            markdown += `-- Get function definition\n`;
-                            markdown += `EXEC sp_helptext '${funcsResult.recordset[0].ROUTINE_SCHEMA}.${funcsResult.recordset[0].ROUTINE_NAME}'\n`;
-                        }
-                        markdown += '```\n\n';
+                    discoveryResult.functions = funcsResult.recordset || [];
+                    markdown += `## Functions (${discoveryResult.functions.length})\n\n`;
+                    if (discoveryResult.functions.length > 0) {
+                        markdown += '| Schema | Function Name |\n|--------|---------------|\n';
+                        discoveryResult.functions.forEach(f => markdown += `| ${f.ROUTINE_SCHEMA} | ${f.ROUTINE_NAME} |\n`);
+                        markdown += `\n### Example:\n\`\`\`sql\nEXEC sp_helptext '${discoveryResult.functions[0].ROUTINE_SCHEMA}.${discoveryResult.functions[0].ROUTINE_NAME}'\n\`\`\`\n\n`;
                     } else {
                         markdown += 'No functions found.\n\n';
                     }
                 }
-                
-                // Add summary and next steps
+
                 markdown += '## Next Steps\n\n';
-                markdown += '1. To query a table:\n';
-                markdown += '```javascript\n';
-                markdown += 'mcp__execute_query({ sql: "SELECT TOP 100 * FROM [schema].[table_name]" })\n';
-                markdown += '```\n\n';
-                
-                markdown += '2. To view table structure:\n';
-                markdown += '```javascript\n';
-                markdown += 'mcp__table_details({ tableName: "table_name" })\n';
-                markdown += '```\n\n';
-                
-                markdown += '3. To view view details:\n';
-                markdown += '```javascript\n';
-                markdown += 'mcp__view_details({ viewName: "view_name" })\n';
-                markdown += '```\n\n';
-                
-                markdown += '4. To view procedure details:\n';
-                markdown += '```javascript\n';
-                markdown += 'mcp__procedure_details({ procedureName: "procedure_name" })\n';
-                markdown += '```\n\n';
-                
+                markdown += '1. To query a table:\n```javascript\nmcp_execute_query({ sql: "SELECT TOP 100 * FROM [schema].[table_name]" })\n```\n\n';
+                markdown += '2. To view table structure:\n```javascript\nmcp_table_details({ tableName: "table_name" })\n```\n\n';
+                markdown += '3. To view view details:\n```javascript\nmcp_view_details({ viewName: "view_name" })\n```\n\n';
+                markdown += '4. To view procedure details:\n```javascript\nmcp_procedure_details({ procedureName: "procedure_name" })\n```\n\n';
+
                 return {
-                    content: [{
-                        type: "text",
-                        text: markdown
-                }],
-                result: {
-                    databaseDiscovery: {
-                        tables: tablesResult.recordset || [],
-                        views: viewsResult.recordset || [],
-                        procedures: procsResult.recordset || [],
-                        functions: funcsResult.recordset || []
-                    }
-                }
+                    content: [{ type: "text", text: markdown }],
+                    result: { databaseDiscovery: discoveryResult }
                 };
             } catch (err) {
                 logger.error(`Error discovering database: ${err.message}`);
-                
                 return {
-                    content: [{
-                        type: "text",
-                        text: `Error discovering database: ${formatSqlError(err)}`
-                    }],
-                    isError: true
+                    content: [{ type: "text", text: `Error discovering database: ${formatSqlError(err)}` }],
+                    isError: true,
+                    error: createJsonRpcError(-32001, `Error discovering database: ${formatSqlError(err)}`)
                 };
             }
     };
-
-    const schema = { 
-        type: z.enum(['tables', 'views', 'procedures', 'functions', 'all']).default('all'),
-        limit: z.number().min(1).max(1000).optional().default(100)
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("discover_database", schema, handler);
-    } else {
-        server.tool("mcp_discover_database", schema, handler);
-    }
+    registerTool(server, "mcp_discover_database", schema, handler);
 }
 
 /**
- * Register the get-query-results tool
+ * Register the get_query_results tool
  * @param {object} server - MCP server instance
- * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerGetQueryResultsTool(server, registerWithAlias) {
+function registerGetQueryResultsTool(server) {
+    const schema = {
+        uuid: z.string().uuid("Invalid UUID format").optional(),
+        limit: z.number().min(1).max(100).optional().default(10) // Limit for preview in markdown
+    };
     const handler = async ({ uuid, limit = 10 }) => {
             try {
-                // If directory doesn't exist, return empty list
                 if (!fs.existsSync(QUERY_RESULTS_PATH)) {
                     return {
-                        content: [{
-                            type: "text",
-                            text: "No query results directory found."
-                        }]
+                        content: [{ type: "text", text: "No query results directory found." }],
+                        result: { recentResults: [] } // Ensure result object is present
                     };
                 }
-                
-                // If UUID is provided, return that specific result
+
                 if (uuid) {
                     const filepath = path.join(QUERY_RESULTS_PATH, `${uuid}.json`);
-                    
                     if (!fs.existsSync(filepath)) {
                         return {
-                            content: [{
-                                type: "text",
-                                text: `Query result with UUID ${uuid} not found.`
-                            }],
-                            isError: true
+                            content: [{ type: "text", text: `Query result with UUID ${uuid} not found.` }],
+                            isError: true,
+                            error: createJsonRpcError(-32002, `Query result with UUID ${uuid} not found.`)
                         };
                     }
-                    
                     try {
-                        // Read the specific result file
                         const data = JSON.parse(fs.readFileSync(filepath, 'utf8'));
-                        
-                        // Format the response
                         let markdown = `# Query Result: ${uuid}\n\n`;
                         markdown += `**Executed**: ${data.metadata.timestamp}\n\n`;
                         markdown += `**Query**: \`\`\`sql\n${data.metadata.query}\n\`\`\`\n\n`;
                         markdown += `**Row Count**: ${data.metadata.rowCount}\n\n`;
-                        
                         if (data.metadata.executionTimeMs) {
                             markdown += `**Execution Time**: ${data.metadata.executionTimeMs}ms\n\n`;
                         }
-                        
+
                         if (data.results && data.results.length > 0) {
-                            markdown += `## Results Preview\n\n`;
-                            
-                            // Create markdown table for preview (limited rows)
+                            markdown += `## Results Preview (first ${limit} rows)\n\n`;
                             const previewRowCount = Math.min(data.results.length, limit);
                             const previewRows = data.results.slice(0, previewRowCount);
-                            
-                            // Table headers
                             markdown += '| ' + Object.keys(previewRows[0]).join(' | ') + ' |\n';
                             markdown += '| ' + Object.keys(previewRows[0]).map(() => '---').join(' | ') + ' |\n';
-                            
-                            // Table rows
                             previewRows.forEach(row => {
-                                markdown += '| ' + Object.values(row).map(v => {
-                                    if (v === null) return 'NULL';
-                                    if (v === undefined) return '';
-                                    if (typeof v === 'object') return JSON.stringify(v);
-                                    return String(v);
-                                }).join(' | ') + ' |\n';
+                                markdown += '| ' + Object.values(row).map(v => v === null ? 'NULL' : (typeof v === 'object' ? JSON.stringify(v) : String(v))).join(' | ') + ' |\n';
                             });
-                            
                             if (data.results.length > previewRowCount) {
-                                markdown += `\n_Showing first ${previewRowCount} of ${data.results.length} rows_\n`;
+                                markdown += `\n_Showing first ${previewRowCount} of ${data.results.length} rows. Full data in result object._\n`;
                             }
+                        } else {
+                            markdown += `No results data found in the file.\n`;
                         }
-                        
+
                         return {
-                            content: [{
-                                type: "text",
-                                text: markdown
-                        }],
-                        result: {
-                            rowCount: data.metadata.rowCount,
-                            results: data.results || [],
-                            metadata: {
-                                uuid: data.metadata.uuid,
-                                pagination: null,
-                                totalCount: data.metadata.totalCount,
-                                executionTimeMs: data.metadata.executionTimeMs
-                            }
-                        }
+                            content: [{ type: "text", text: markdown }],
+                            // The full results are in the data object
+                            result: data
                         };
                     } catch (err) {
-                        logger.error(`Error reading query result: ${err.message}`);
-                        
+                        logger.error(`Error reading query result file ${uuid}.json: ${err.message}`);
                         return {
-                            content: [{
-                                type: "text",
-                                text: `Error reading query result: ${err.message}`
-                            }],
-                            isError: true
+                            content: [{ type: "text", text: `Error reading query result: ${err.message}` }],
+                            isError: true,
+                            error: createJsonRpcError(-32001, `Error reading query result: ${err.message}`)
                         };
                     }
                 } else {
                     // List recent results
                     try {
-                        // Get all JSON files in the directory
                         const files = fs.readdirSync(QUERY_RESULTS_PATH)
                             .filter(file => file.endsWith('.json'))
                             .map(file => {
@@ -1333,1051 +1089,675 @@ function registerGetQueryResultsTool(server, registerWithAlias) {
                                         executionTimeMs: data.metadata.executionTimeMs
                                     };
                                 } catch (err) {
-                                    return {
-                                        uuid: file.replace('.json', ''),
-                                        error: 'Could not read file metadata'
-                                    };
+                                    return { uuid: file.replace('.json', ''), error: 'Could not read file metadata' };
                                 }
                             })
-                            // Sort by timestamp (most recent first)
-                            .sort((a, b) => {
-                                if (!a.timestamp) return 1;
-                                if (!b.timestamp) return -1;
-                                return new Date(b.timestamp) - new Date(a.timestamp);
-                            })
-                            // Limit to requested number
+                            .sort((a, b) => (a.timestamp && b.timestamp) ? new Date(b.timestamp) - new Date(a.timestamp) : 0)
                             .slice(0, limit);
-                        
-                        // Format the response
-                        let markdown = `# Recent Query Results\n\n`;
-                        
+
+                        let markdown = `# Recent Query Results (up to ${limit})\n\n`;
                         if (files.length === 0) {
                             markdown += 'No saved query results found.\n';
                         } else {
-                            markdown += '| UUID | Timestamp | Query | Row Count |\n';
-                            markdown += '|------|-----------|-------|----------|\n';
-                            
-                            files.forEach(result => {
-                                const queryPreview = result.query ? 
-                                    (result.query.length > 50 ? result.query.substring(0, 50) + '...' : result.query) : 
-                                    'N/A';
-                                
-                                markdown += `| ${result.uuid} | ${result.timestamp || 'N/A'} | \`${queryPreview}\` | ${result.rowCount || 'N/A'} |\n`;
+                            markdown += '| UUID | Timestamp | Query Preview | Row Count |\n';
+                            markdown += '|------|-----------|---------------|----------|\n';
+                            files.forEach(f => {
+                                const queryPreview = f.query ? (f.query.length > 50 ? f.query.substring(0, 47) + '...' : f.query) : 'N/A';
+                                markdown += `| ${f.uuid} | ${f.timestamp || 'N/A'} | \`${queryPreview}\` | ${f.rowCount === undefined ? 'N/A' : f.rowCount} |\n`;
                             });
-                            
-                            markdown += `\n## Viewing Specific Results\n\n`;
-                            markdown += `To view details for a specific result, use:\n\n`;
-                            markdown += `\`\`\`javascript\n`;
-                            markdown += `mcp__get_query_results({ uuid: "${files[0].uuid}" })\n`;
-                            markdown += `\`\`\`\n`;
+                            if (files.length > 0 && files[0].uuid) {
+                                markdown += `\n## Viewing Specific Results\n\nTo view details for a specific result, use:\n\`\`\`javascript\nmcp_get_query_results({ uuid: "${files[0].uuid}" })\n\`\`\`\n`;
+                            }
                         }
-                        
                         return {
-                            content: [{
-                                type: "text",
-                                text: markdown
-                        }],
-                        result: {
-                            recentResults: files.map(result => ({
-                                uuid: result.uuid,
-                                timestamp: result.timestamp,
-                                query: result.query,
-                                rowCount: result.rowCount,
-                                executionTimeMs: result.executionTimeMs
-                            }))
-                        }
+                            content: [{ type: "text", text: markdown }],
+                            result: { recentResults: files }
                         };
                     } catch (err) {
                         logger.error(`Error listing query results: ${err.message}`);
-                        
                         return {
-                            content: [{
-                                type: "text",
-                                text: `Error listing query results: ${err.message}`
-                            }],
-                            isError: true
+                            content: [{ type: "text", text: `Error listing query results: ${err.message}` }],
+                            isError: true,
+                            error: createJsonRpcError(-32001, `Error listing query results: ${err.message}`)
                         };
                     }
                 }
             } catch (err) {
                 logger.error(`Error processing query results: ${err.message}`);
-                
                 return {
-                    content: [{
-                        type: "text",
-                        text: `Error processing query results: ${err.message}`
-                    }],
-                    isError: true
+                    content: [{ type: "text", text: `Error processing query results: ${err.message}` }],
+                    isError: true,
+                    error: createJsonRpcError(-32000, `Error processing query results: ${err.message}`)
                 };
             }
     };
-
-    const schema = { 
-        uuid: z.string().uuid("Invalid UUID format").optional(),
-        limit: z.number().min(1).max(100).optional().default(10)
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("get_query_results", schema, handler);
-    } else {
-        server.tool("mcp_get_query_results", schema, handler);
-    }
+    registerTool(server, "mcp_get_query_results", schema, handler);
 }
 
 /**
- * Register the discover tool - provides a database overview
+ * Register the discover_database_overview tool - provides a general database overview.
+ * Renamed from registerDiscoverTool for clarity.
  * @param {object} server - MCP server instance
- * @param {function} registerWithAllAliases - Helper to register with all name variants
  */
-function registerDiscoverTool(server, registerWithAllAliases) {
-    // Define schema with optional random_string parameter (for compatibility)
+function registerDiscoverDatabaseOverviewTool(server) {
     const schema = {
-        random_string: z.string().optional()
+        // Retaining optional random_string for compatibility if SDK requires parameters,
+        // but clarifying its purpose. Ideally, SDK supports parameterless tools.
+        random_string: z.string().optional().describe("Optional dummy parameter, not used by the tool's logic. Provided for compatibility if tools without parameters are not fully supported.")
     };
-    
     const handler = async (args) => {
         try {
-            // Get tables (limited to 100)
-            const tablesResult = await executeQuery(`
-                SELECT TOP 100
-                        TABLE_SCHEMA,
-                    TABLE_NAME,
-                    TABLE_TYPE
-                    FROM 
-                        INFORMATION_SCHEMA.TABLES
-                ORDER BY 
-                    TABLE_SCHEMA, TABLE_NAME
-            `);
-            
-            // Get stored procedures (limited to 100)
-            const procsResult = await executeQuery(`
-                SELECT TOP 100
-                    ROUTINE_SCHEMA,
-                    ROUTINE_NAME,
-                    ROUTINE_TYPE
-                FROM 
-                    INFORMATION_SCHEMA.ROUTINES
-                    WHERE 
-                    ROUTINE_TYPE = 'PROCEDURE'
-                    ORDER BY
-                    ROUTINE_SCHEMA, ROUTINE_NAME
-            `);
-            
-            // Get functions (limited to 100)
-            const funcsResult = await executeQuery(`
-                SELECT TOP 100
-                    ROUTINE_SCHEMA,
-                    ROUTINE_NAME,
-                    ROUTINE_TYPE
-                FROM 
-                    INFORMATION_SCHEMA.ROUTINES
-                WHERE 
-                    ROUTINE_TYPE = 'FUNCTION'
-                ORDER BY 
-                    ROUTINE_SCHEMA, ROUTINE_NAME
-            `);
-            
-            // Get views (actually included in tables with TABLE_TYPE = 'VIEW')
-            const viewsResult = await executeQuery(`
-                SELECT TOP 100
-                    TABLE_SCHEMA,
-                        TABLE_NAME
-                FROM 
-                    INFORMATION_SCHEMA.VIEWS
-                ORDER BY 
-                    TABLE_SCHEMA, TABLE_NAME
-            `);
-            
-            // Format the output as markdown
+            const tablesResult = await executeQuery("SELECT TOP 100 TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_SCHEMA, TABLE_NAME");
+            const procsResult = await executeQuery("SELECT TOP 100 ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_TYPE = 'PROCEDURE' ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME");
+            const funcsResult = await executeQuery("SELECT TOP 100 ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_TYPE = 'FUNCTION' ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME");
+            const viewsResult = await executeQuery("SELECT TOP 100 TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS ORDER BY TABLE_SCHEMA, TABLE_NAME");
+
             let markdown = `# Database Overview\n\n`;
-            
-            // Tables section
-            markdown += `## Tables\n\n`;
-            markdown += `| Schema | Table | Type |\n`;
-            markdown += `| ------ | ----- | ---- |\n`;
-            
-            tablesResult.recordset.forEach(table => {
-                markdown += `| ${table.TABLE_SCHEMA} | ${table.TABLE_NAME} | ${table.TABLE_TYPE} |\n`;
-            });
-            
-            if (tablesResult.recordset.length === 100) {
-                markdown += `\n_Showing first 100 tables. There may be more._\n\n`;
-            }
-            
-            // Stored Procedures section
-            markdown += `## Stored Procedures\n\n`;
-            markdown += `| Schema | Procedure |\n`;
-            markdown += `| ------ | --------- |\n`;
-            
-            procsResult.recordset.forEach(proc => {
-                markdown += `| ${proc.ROUTINE_SCHEMA} | ${proc.ROUTINE_NAME} |\n`;
-            });
-            
-            if (procsResult.recordset.length === 100) {
-                markdown += `\n_Showing first 100 procedures. There may be more._\n\n`;
-            }
-            
-            // Functions section
-            markdown += `## Functions\n\n`;
-            markdown += `| Schema | Function |\n`;
-            markdown += `| ------ | -------- |\n`;
-            
-            funcsResult.recordset.forEach(func => {
-                markdown += `| ${func.ROUTINE_SCHEMA} | ${func.ROUTINE_NAME} |\n`;
-            });
-            
-            if (funcsResult.recordset.length === 100) {
-                markdown += `\n_Showing first 100 functions. There may be more._\n\n`;
-            }
-            
-            // Views section
-            markdown += `## Views\n\n`;
-            markdown += `| Schema | View |\n`;
-            markdown += `| ------ | ---- |\n`;
-            
-            viewsResult.recordset.forEach(view => {
-                markdown += `| ${view.TABLE_SCHEMA} | ${view.TABLE_NAME} |\n`;
-            });
-            
-            if (viewsResult.recordset.length === 100) {
-                markdown += `\n_Showing first 100 views. There may be more._\n\n`;
-            }
-            
-            // Add usage examples
+            markdown += `## Tables (Top 100)\n| Schema | Table | Type |\n| ------ | ----- | ---- |\n`;
+            (tablesResult.recordset || []).forEach(t => markdown += `| ${t.TABLE_SCHEMA} | ${t.TABLE_NAME} | ${t.TABLE_TYPE} |\n`);
+            if ((tablesResult.recordset || []).length === 100) markdown += `\n_Showing first 100 tables. There may be more._\n\n`;
+
+            markdown += `\n## Stored Procedures (Top 100)\n| Schema | Procedure |\n| ------ | --------- |\n`;
+            (procsResult.recordset || []).forEach(p => markdown += `| ${p.ROUTINE_SCHEMA} | ${p.ROUTINE_NAME} |\n`);
+            if ((procsResult.recordset || []).length === 100) markdown += `\n_Showing first 100 procedures. There may be more._\n\n`;
+
+            markdown += `\n## Functions (Top 100)\n| Schema | Function |\n| ------ | -------- |\n`;
+            (funcsResult.recordset || []).forEach(f => markdown += `| ${f.ROUTINE_SCHEMA} | ${f.ROUTINE_NAME} |\n`);
+            if ((funcsResult.recordset || []).length === 100) markdown += `\n_Showing first 100 functions. There may be more._\n\n`;
+
+            markdown += `\n## Views (Top 100)\n| Schema | View |\n| ------ | ---- |\n`;
+            (viewsResult.recordset || []).forEach(v => markdown += `| ${v.TABLE_SCHEMA} | ${v.TABLE_NAME} |\n`);
+            if ((viewsResult.recordset || []).length === 100) markdown += `\n_Showing first 100 views. There may be more._\n\n`;
+
             markdown += `## Usage Examples\n\n`;
-            markdown += `### Get Table Details\n`;
-            markdown += "```javascript\n";
-            markdown += `mcp_table_details({ tableName: "TableName" })\n`;
-            markdown += "```\n\n";
-            
-            markdown += `### Execute Query\n`;
-            markdown += "```javascript\n";
-            markdown += `mcp_execute_query({ sql: "SELECT TOP 10 * FROM TableName" })\n`;
-            markdown += "```\n\n";
-            
-            markdown += `### Get Database Schema\n`;
-            markdown += "```javascript\n";
-            markdown += `mcp_discover_database()\n`;
-            markdown += "```\n";
-            
-            // Return the result in MCP format with both content and structured data
-                return {
-                    content: [{
-                        type: "text",
-                    text: markdown
-                }],
+            markdown += `### Get Table Details:\n\`\`\`javascript\nmcp_table_details({ tableName: "schema.TableName" })\n\`\`\`\n\n`;
+            markdown += `### Execute Query:\n\`\`\`javascript\nmcp_execute_query({ sql: "SELECT TOP 10 * FROM schema.TableName" })\n\`\`\`\n\n`;
+            markdown += `### Discover Database Objects (more detailed):\n\`\`\`javascript\nmcp_discover_database({ type: "all", limit: 100 })\n\`\`\`\n`;
+
+            return {
+                content: [{ type: "text", text: markdown }],
                 result: {
                     tables: tablesResult.recordset || [],
                     procedures: procsResult.recordset || [],
                     functions: funcsResult.recordset || [],
                     views: viewsResult.recordset || []
                 }
-                };
-            } catch (err) {
-            logger.error(`Error in discover tool: ${err.message}`);
-                
-                return {
-                    content: [{
-                        type: "text",
-                    text: `Error getting database overview: ${formatSqlError(err)}`
-                    }],
-                    isError: true
-                };
-            }
+            };
+        } catch (err) {
+            logger.error(`Error in discover_database_overview tool: ${err.message}`);
+            return {
+                content: [{ type: "text", text: `Error getting database overview: ${formatSqlError(err)}` }],
+                isError: true,
+                error: createJsonRpcError(-32001, `Error getting database overview: ${formatSqlError(err)}`)
+            };
+        }
     };
-    
-    // Register with all aliases
-    if (registerWithAllAliases) {
-        registerWithAllAliases("discover", schema, handler);
-    } else {
-        server.tool("discover", schema, handler);
-    }
+    registerTool(server, "mcp_discover_database_overview", schema, handler);
 }
 
 /**
- * Register the cursor-guide tool
+ * Register the pagination_guide tool - provides a guide to cursor-based pagination.
+ * Renamed from registerCursorGuideTool for clarity.
  * @param {object} server - MCP server instance
- * @param {function} registerWithAllAliases - Helper to register with all name variants
  */
-function registerCursorGuideTool(server, registerWithAllAliases) {
-    const cursorGuideSchema = {
-        random_string: z.string().optional().describe("Dummy parameter for no-parameter tools")
+function registerPaginationGuideTool(server) {
+    const schema = {
+        // Retaining optional random_string for compatibility if SDK requires parameters,
+        // but clarifying its purpose. Ideally, SDK supports parameterless tools.
+        random_string: z.string().optional().describe("Optional dummy parameter, not used by the tool's logic. Provided for compatibility if tools without parameters are not fully supported.")
     };
-    
     const handler = async (args) => {
-        // Comprehensive guide for cursor-based pagination
         const guideText = `
 # SQL Cursor-Based Pagination Guide
 
 Cursor-based pagination is an efficient approach for paginating through large datasets, especially when:
-- You need stable pagination through frequently changing data
-- You're handling very large datasets where OFFSET/LIMIT becomes inefficient
-- You want better performance for deep pagination
+- You need stable pagination through frequently changing data.
+- You're handling very large datasets where OFFSET/LIMIT becomes inefficient.
+- You want better performance for deep pagination.
 
 ## Key Concepts
 
-1. **Cursor**: A pointer to a specific item in a dataset, typically based on a unique, indexed field
-2. **Direction**: You can paginate forward (next) or backward (previous)
-3. **Page Size**: The number of items to return per request
+1.  **Cursor**: A pointer to a specific item in a dataset, typically based on a unique, indexed field (or combination of fields).
+2.  **Direction**: You can paginate forward ('next') or backward ('prev').
+3.  **Page Size**: The number of items to return per request.
+4.  **Cursor Field**: The field(s) used for ordering and creating the cursor. Must be consistently ordered.
 
-## Example Usage
-
-Using cursor-based pagination with our SQL tools:
+## Example Usage with \`mcp_paginated_query\`
 
 \`\`\`javascript
-// First page (no cursor)
+// First page (no cursor provided)
 const firstPage = await tool.call("mcp_paginated_query", {
-  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC",
+  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC, id DESC", // Consistent ORDER BY
   pageSize: 20,
-  cursorField: "created_at"
+  cursorField: "created_at,id" // Compound cursor field if created_at is not unique
 });
+
+// Response from firstPage might include:
+// firstPage.result.metadata.pagination.nextCursor = "some_encoded_cursor_value"
 
 // Next page (using cursor from previous response)
-const nextPage = await tool.call("mcp_paginated_query", {
-  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC",
-  pageSize: 20,
-  cursorField: "created_at",
-  cursor: firstPage.result.pagination.nextCursor,
-  direction: "next"
-});
+if (firstPage.result.metadata.pagination.nextCursor) {
+  const nextPage = await tool.call("mcp_paginated_query", {
+    sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC, id DESC",
+    pageSize: 20,
+    cursorField: "created_at,id",
+    cursor: firstPage.result.metadata.pagination.nextCursor,
+    direction: "next" // Default is 'next', can be explicit
+  });
+}
 
-// Previous page (going back)
-const prevPage = await tool.call("mcp_paginated_query", {
-  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC",
-  pageSize: 20,
-  cursorField: "created_at",
-  cursor: nextPage.result.pagination.prevCursor,
-  direction: "prev"
-});
+// Previous page (going back from nextPage)
+// nextPage.result.metadata.pagination.prevCursor = "another_encoded_cursor_value"
+if (nextPage.result.metadata.pagination.prevCursor) {
+  const prevPage = await tool.call("mcp_paginated_query", {
+    sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC, id DESC",
+    pageSize: 20,
+    cursorField: "created_at,id",
+    cursor: nextPage.result.metadata.pagination.prevCursor,
+    direction: "prev"
+  });
+}
 \`\`\`
 
 ## Best Practices
 
-1. **Choose an appropriate cursor field**:
-   - Should be unique or nearly unique (ideally indexed)
-   - Common choices: timestamps, auto-incrementing IDs
-   - Compound cursors can be used for non-unique fields (e.g., "timestamp:id")
+1.  **Choose an appropriate \`cursorField\`**:
+    *   Should be unique or a combination of fields that guarantees uniqueness (e.g., "timestamp,id").
+    *   The field(s) must be indexed for performance.
+    *   Common choices: creation/update timestamps, auto-incrementing IDs.
 
-2. **Order matters**:
-1. Use indexed fields for the cursor field to improve performance
-2. Include the ORDER BY clause that matches your cursor field
-3. For complex queries, use a subquery to ensure proper ordering`;
+2.  **Consistent \`ORDER BY\` Clause**:
+    *   The \`ORDER BY\` clause in your SQL query **must** match the \`cursorField\` and its order.
+    *   For descending order on a field, the pagination logic will handle it correctly.
+    *   If \`cursorField\` is compound (e.g., "field1,field2"), the \`ORDER BY\` should be \`ORDER BY field1, field2\`.
 
+3.  **Use \`mcp_paginated_query\`**: This tool is specifically designed for robust cursor-based pagination.
+
+4.  **Subqueries**: For complex queries, consider applying pagination to a simplified subquery that provides the ordered keys/cursor fields, then join the full data.
+`;
         return {
-            content: [{
-                type: "text",
-                text: guideText
-            }],
-            result: {
-                guide: "SQL pagination guide provided successfully"
-            }
+            content: [{ type: "text", text: guideText }],
+            result: { guide: "SQL pagination guide provided successfully." }
         };
     };
-
-    if (registerWithAllAliases) {
-        registerWithAllAliases("cursor_guide", cursorGuideSchema, handler);
-    } else {
-        server.tool("cursor_guide", cursorGuideSchema, handler);
-        // Register the guide using native server.tool
-        server.tool("mcp_cursor_guide", cursorGuideSchema, handler);
-    }
+    registerTool(server, "mcp_pagination_guide", schema, handler);
 }
 
 /**
- * Register the paginated-query tool
+ * Register the paginated_query tool
  * @param {object} server - MCP server instance
- * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerPaginatedQueryTool(server, registerWithAlias) {
-    const handler = async ({ 
-        sql, 
-        cursorField, 
-        pageSize = 50, 
-        cursor, 
-        parameters = {}, 
-        includeCount = true,
+function registerPaginatedQueryTool(server) {
+    const schema = {
+        sql: z.string().min(1, "SQL query cannot be empty"),
+        cursorField: z.string().optional().describe("Comma-separated field(s) for cursor. Must match ORDER BY clause."),
+        pageSize: z.number().min(1).max(1000).optional().default(50),
+        cursor: z.string().optional().describe("Encoded cursor value from previous page."),
+        parameters: z.record(z.any()).optional(),
+        includeCount: z.boolean().optional().default(true).describe("Whether to include total record count (can be expensive)."),
+        direction: z.enum(['next', 'prev']).optional().default('next'),
+        returnTotals: z.boolean().optional().default(true).describe("Legacy. Use includeCount. If false, totalCount might be null.") // Consider merging with includeCount
+    };
+
+    const handler = async ({
+        sql,
+        cursorField,
+        pageSize = 50,
+        cursor,
+        parameters = {},
+        includeCount = true, // Prioritize this over returnTotals
         direction = 'next',
-        returnTotals = true
+        returnTotals = true // Kept for now, but logic uses includeCount
     }) => {
-        // Basic validation to prevent destructive operations
         const lowerSql = sql.toLowerCase();
         const prohibitedOperations = ['drop ', 'delete ', 'truncate ', 'update ', 'alter '];
-        
         if (prohibitedOperations.some(op => lowerSql.includes(op))) {
             return {
-                content: [{
-                    type: "text",
-                    text: "⚠️ Error: Data modification operations (DROP, DELETE, UPDATE, TRUNCATE, ALTER) are not allowed for safety reasons."
-                }],
-                isError: true
+                content: [{ type: "text", text: "⚠️ Error: Data modification operations are not allowed." }],
+                isError: true,
+                error: createJsonRpcError(-32000, "Data modification operations are not allowed.")
             };
         }
-        
+
         try {
-            // Get total count if requested
             let totalCount = null;
             let estimatedTotalPages = null;
-            let currentPage = null;
-            
-            if (includeCount) {
+
+            const actualIncludeCount = includeCount || returnTotals; // Combine logic
+
+            if (actualIncludeCount) {
                 try {
-                    // Extract query without ORDER BY, OFFSET, etc. for count query
                     let countSql = sql;
-                    
-                    // Remove ORDER BY, OFFSET/FETCH clauses for count query
                     countSql = countSql.replace(/\s+ORDER\s+BY\s+.+?(?:(?:OFFSET|FETCH|$))/i, ' ');
                     countSql = countSql.replace(/\s+OFFSET\s+.+?(?:FETCH|$)/i, ' ');
                     countSql = countSql.replace(/\s+FETCH\s+.+?$/i, ' ');
-                    
-                    // Wrap in a count query
-                    countSql = `SELECT COUNT(*) AS TotalCount FROM (${countSql}) AS CountQuery`;
-                    
+                    countSql = `SELECT COUNT_BIG(*) AS TotalCount FROM (${countSql}) AS CountQuery`; // Use COUNT_BIG for large tables
                     logger.info(`Executing count query: ${countSql}`);
-                    
-                    // Execute count query
                     const countResult = await executeQuery(countSql, parameters);
-                    
                     if (countResult.recordset && countResult.recordset.length > 0) {
-                        totalCount = countResult.recordset[0].TotalCount;
+                        totalCount = Number(countResult.recordset[0].TotalCount); // Ensure it's a number
                         estimatedTotalPages = Math.ceil(totalCount / pageSize);
                         logger.info(`Total count query returned: ${totalCount} rows (${estimatedTotalPages} pages)`);
                     }
                 } catch (countErr) {
-                    logger.warn(`Error executing count query: ${countErr.message}`);
-                    // Continue without count if it fails
+                    logger.warn(`Error executing count query: ${countErr.message}. Proceeding without total count.`);
+                    // Do not set totalCount to null here if it was already calculated from a previous page in the cursor
                 }
             }
-            
-            // Determine cursor field if not provided
-            const defaultCursorField = extractDefaultCursorField(sql);
+
+            const defaultCursorField = extractDefaultCursorField(sql); // Extracts from ORDER BY
             const effectiveCursorField = cursorField || defaultCursorField;
-            
-            logger.info(`Using cursor field: ${effectiveCursorField}`);
-            
-            // Apply pagination transformation
-            const { paginatedSql, parameters: paginatedParams } = 
-                paginateQuery(sql, { 
-                    cursorField: effectiveCursorField, 
-                    pageSize, 
-                    cursor, 
-                    parameters,
-                    defaultCursorField
-                });
-            
-            logger.info(`Paginated SQL: ${paginatedSql}`);
-            
-            // Execute the paginated query
-            const result = await executeQuery(paginatedSql, paginatedParams);
-            const rowCount = result.recordset?.length || 0;
-            
-            // Generate cursors for navigation
-            let nextCursor = null;
-            let prevCursor = null;
-            
-            if (rowCount > 0) {
-                // Generate next cursor if we got a full page
-                const hasMore = rowCount >= pageSize;
-                nextCursor = hasMore
-                    ? generateNextCursor(result.recordset[rowCount - 1], effectiveCursorField)
-                    : null;
-                
-                // Generate previous cursor
-                prevCursor = cursor 
-                    ? generatePrevCursor(result.recordset[0], effectiveCursorField) 
-                    : null;
+            if (!effectiveCursorField) {
+                throw new Error("Cursor field is required for pagination. Provide cursorField or ensure SQL has an ORDER BY clause.");
             }
-            
-            // Generate UUID for the output file
+            logger.info(`Using cursor field: ${effectiveCursorField}`);
+
+            const { paginatedSql, parameters: paginatedParams } =
+                paginateQuery(sql, {
+                    cursorField: effectiveCursorField,
+                    pageSize,
+                    cursor,
+                    parameters,
+                    defaultCursorField // Already determined
+                });
+            logger.info(`Paginated SQL: ${paginatedSql}`);
+
+            const startTime = Date.now();
+            const result = await executeQuery(paginatedSql, paginatedParams);
+            const executionTime = Date.now() - startTime;
+            const rowCount = result.recordset?.length || 0;
+
+            let nextCursorValue = null;
+            let prevCursorValue = null;
+
+            if (rowCount > 0) {
+                const hasMore = rowCount >= pageSize; // If we got a full page, there might be more
+                nextCursorValue = hasMore ? generateNextCursor(result.recordset[rowCount - 1], effectiveCursorField) : null;
+                // Previous cursor should ideally be generated based on the *first* item of the current set,
+                // but only if a cursor was provided (i.e., not on the first page).
+                prevCursorValue = cursor ? generatePrevCursor(result.recordset[0], effectiveCursorField) : null;
+            }
+
+
             const uuid = crypto.randomUUID();
             const filename = `${uuid}.json`;
             const filepath = path.join(QUERY_RESULTS_PATH, filename);
-            
-            // Add pagination metadata
-            const paginationMeta = {
+
+            const paginationMeta = formatPaginationMetadata({
                 cursorField: effectiveCursorField,
                 pageSize,
                 returnedRows: rowCount,
-                hasMore: !!nextCursor,
-                nextCursor,
-                prevCursor,
+                nextCursor: nextCursorValue,
+                prevCursor: prevCursorValue, // Use the generated one
                 direction,
-                totalCount,
-                estimatedTotalPages
-            };
+                totalCount: totalCount, // Use the determined totalCount
+                estimatedTotalPages,
+                originalCursor: cursor // Include the cursor that generated this page
+            });
             
-            // Save results to a JSON file
             if (result.recordset && result.recordset.length > 0) {
-                try {
+                 try {
                     const resultWithMetadata = {
                         metadata: {
                             uuid,
                             timestamp: new Date().toISOString(),
-                            query: sql,
+                            query: sql, // Original SQL
                             parameters: Object.keys(parameters).length > 0 ? parameters : undefined,
-                            rowCount,
-                            executionTimeMs: result.executionTime || 0,
+                            rowCount, // Rows in this page
+                            executionTimeMs: executionTime,
                             pagination: paginationMeta
                         },
                         results: result.recordset || []
                     };
-                    
+                    if (!fs.existsSync(QUERY_RESULTS_PATH)) fs.mkdirSync(QUERY_RESULTS_PATH, { recursive: true });
                     fs.writeFileSync(filepath, JSON.stringify(resultWithMetadata, null, 2));
                     logger.info(`Paginated query results saved to ${filepath}`);
                 } catch (writeError) {
                     logger.error(`Error saving query results to file: ${writeError.message}`);
                 }
             }
-            
-            // Format response markdown
+
             let markdown = `# Paginated Query Results\n\n`;
-            
-            // Add summary stats
-            markdown += `Query executed successfully in ${result.executionTime || 0}ms and returned ${rowCount} rows.`;
-            
-            if (totalCount !== null && returnTotals) {
-                markdown += ` (${totalCount} total rows)`;
+            markdown += `Query executed in ${executionTime}ms, returned ${rowCount} rows.\n`;
+            if (paginationMeta.totalCount !== null) {
+                markdown += ` Total records: ${paginationMeta.totalCount}. Page ${paginationMeta.currentPage || '-'} of ${paginationMeta.totalPages || '-'}.\n`;
             }
-            
-            markdown += '\n\n';
-            
-            if (totalCount !== null && returnTotals) {
-                markdown += `## Pagination Overview\n\n`;
-                markdown += `- **Total Records**: ${totalCount}\n`;
-                markdown += `- **Page Size**: ${pageSize}\n`;
-                markdown += `- **Total Pages**: ${estimatedTotalPages}\n`;
-                markdown += `- **Cursor Field**: ${effectiveCursorField}\n\n`;
-            }
-            
-            // Results preview
+            markdown += `Cursor field: \`${effectiveCursorField}\`. Page size: ${pageSize}.\n\n`;
+
+
             if (rowCount > 0) {
-                markdown += `## Results Preview\n\n`;
-                
-                // Format as markdown table (limited to 10 rows for preview)
+                markdown += `## Results Preview (first 10 rows)\n\n`;
                 const previewRows = result.recordset.slice(0, 10);
-                
-                // Table headers
                 markdown += '| ' + Object.keys(previewRows[0]).join(' | ') + ' |\n';
                 markdown += '| ' + Object.keys(previewRows[0]).map(() => '---').join(' | ') + ' |\n';
-                
-                // Table rows
                 previewRows.forEach(row => {
-                    markdown += '| ' + Object.values(row).map(v => {
-                        if (v === null) return 'NULL';
-                        if (v === undefined) return '';
-                        if (typeof v === 'object') return JSON.stringify(v);
-                        return String(v);
-                    }).join(' | ') + ' |\n';
+                    markdown += '| ' + Object.values(row).map(v => v === null ? 'NULL' : (typeof v === 'object' ? JSON.stringify(v) : String(v))).join(' | ') + ' |\n';
                 });
-                
                 if (result.recordset.length > 10) {
                     markdown += `\n_Showing first 10 of ${result.recordset.length} rows._\n\n`;
                 }
-                } else {
-                markdown += `\n**No results returned.**\n\n`;
+            } else {
+                markdown += `\n**No results returned for this page.**\n\n`;
             }
-            
-            // Full results reference
-            markdown += `\n📄 Complete results saved with ID: \`${uuid}\`\n\n`;
-            markdown += `To view full results:\n`;
-            markdown += `\`\`\`javascript\n`;
-            markdown += `mcp__get_query_results({ uuid: "${uuid}" })\n`;
-            markdown += `\`\`\`\n\n`;
-            
-            // Navigation section
+
+            markdown += `\n📄 Complete results for this page saved with ID: \`${uuid}\`\n`;
+            markdown += `To view these results: \`mcp_get_query_results({ uuid: "${uuid}" })\`\n\n`;
+
             markdown += `## Navigation\n\n`;
-            
-            if (nextCursor) {
-                markdown += `### Next Page\n\n`;
-                markdown += `\`\`\`javascript\n`;
-                markdown += `mcp__paginated_query({
-  sql: ${JSON.stringify(sql)},
-  pageSize: ${pageSize},
-  cursorField: "${effectiveCursorField}",
-  cursor: "${nextCursor}",
-  direction: "next",
-  includeCount: ${includeCount},
-  returnTotals: ${returnTotals}
-})\n`;
-                markdown += `\`\`\`\n\n`;
-                } else {
-                markdown += `**No more results available.**\n\n`;
+            const navBaseArgs = {
+                sql: JSON.stringify(sql),
+                pageSize: pageSize,
+                cursorField: `"${effectiveCursorField}"`,
+                includeCount: actualIncludeCount,
+                // parameters: parameters // Note: parameters can be large, consider omitting from examples for brevity
+            };
+            if (Object.keys(parameters).length > 0) {
+                 markdown += `// Original parameters were: ${JSON.stringify(parameters)}\n`;
             }
-            
-            if (prevCursor) {
-                markdown += `### Previous Page\n\n`;
-                markdown += `\`\`\`javascript\n`;
-                markdown += `mcp__paginated_query({
-  sql: ${JSON.stringify(sql)},
-  pageSize: ${pageSize},
-  cursorField: "${effectiveCursorField}",
-  cursor: "${prevCursor}",
-  direction: "prev",
-  includeCount: ${includeCount},
-  returnTotals: ${returnTotals}
-})\n`;
-                markdown += `\`\`\`\n\n`;
+
+
+            if (paginationMeta.nextCursor) {
+                markdown += `### Next Page:\n\`\`\`javascript\nmcp_paginated_query({\n  sql: ${navBaseArgs.sql},\n  pageSize: ${navBaseArgs.pageSize},\n  cursorField: ${navBaseArgs.cursorField},\n  cursor: "${paginationMeta.nextCursor}",\n  direction: "next",\n  includeCount: ${navBaseArgs.includeCount}\n})\n\`\`\`\n\n`;
+            } else {
+                markdown += `**No more results (next page).**\n\n`;
             }
-            
-            // Reset to first page option
-            if (cursor) {
-                markdown += `### Return to First Page\n\n`;
-                markdown += `\`\`\`javascript\n`;
-                markdown += `mcp__paginated_query({
-  sql: ${JSON.stringify(sql)},
-  pageSize: ${pageSize},
-  cursorField: "${effectiveCursorField}",
-  includeCount: ${includeCount},
-  returnTotals: ${returnTotals}
-})\n`;
-                markdown += `\`\`\`\n`;
+            if (paginationMeta.prevCursor) {
+                markdown += `### Previous Page:\n\`\`\`javascript\nmcp_paginated_query({\n  sql: ${navBaseArgs.sql},\n  pageSize: ${navBaseArgs.pageSize},\n  cursorField: ${navBaseArgs.cursorField},\n  cursor: "${paginationMeta.prevCursor}",\n  direction: "prev",\n  includeCount: ${navBaseArgs.includeCount}\n})\n\`\`\`\n\n`;
             }
-                
-                return {
-                    content: [{
-                        type: "text",
-                    text: markdown
-                }],
+            if (cursor) { // Only show "first page" if not already on it (i.e., if a cursor was used)
+                markdown += `### Return to First Page:\n\`\`\`javascript\nmcp_paginated_query({\n  sql: ${navBaseArgs.sql},\n  pageSize: ${navBaseArgs.pageSize},\n  cursorField: ${navBaseArgs.cursorField},\n  includeCount: ${navBaseArgs.includeCount}\n})\n\`\`\`\n`;
+            }
+
+            return {
+                content: [{ type: "text", text: markdown }],
                 result: {
-                    rowCount: rowCount,
+                    rowCount: rowCount, // Rows in current page
                     results: result.recordset || [],
                     metadata: {
-                        uuid: uuid,
+                        uuid: uuid, // UUID for this page's saved file
                         pagination: paginationMeta,
-                        totalCount: totalCount,
-                        executionTimeMs: result.executionTime || 0
+                        executionTimeMs: executionTime
+                        // totalCount is now part of paginationMeta
                     }
                 }
-                };
-            } catch (err) {
+            };
+        } catch (err) {
             logger.error(`Error executing paginated query: ${err.message}`);
-                
-                return {
-                    content: [{
-                        type: "text",
-                    text: `Error executing paginated query: ${formatSqlError(err)}`
-                    }],
-                    isError: true
-                };
-            }
+            const formattedError = formatSqlError(err);
+            return {
+                content: [{ type: "text", text: `Error executing paginated query: ${formattedError}` }],
+                isError: true,
+                error: createJsonRpcError(-32001, `Paginated query failed: ${formattedError}`)
+            };
+        }
     };
-
-    const schema = {
-        sql: z.string().min(1, "SQL query cannot be empty"),
-        cursorField: z.string().optional(),
-        pageSize: z.number().min(1).max(1000).optional().default(50),
-        cursor: z.string().optional(),
-        parameters: z.record(z.any()).optional(),
-        includeCount: z.boolean().optional().default(true),
-        direction: z.enum(['next', 'prev']).optional().default('next'),
-        returnTotals: z.boolean().optional().default(true)
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("paginated_query", schema, handler);
-    } else {
-        server.tool("mcp_paginated_query", schema, handler);
-    }
+    registerTool(server, "mcp_paginated_query", schema, handler);
 }
 
 /**
- * Register the query-streamer tool
+ * Register the query_streamer tool
  * @param {object} server - MCP server instance
- * @param {function} registerWithAlias - Optional helper to register with aliases
  */
-function registerQueryStreamerTool(server, registerWithAlias) {
-    const handler = async ({ 
-        sql, 
-        batchSize = 1000, 
-        maxRows = 100000, 
-        parameters = {}, 
+function registerQueryStreamerTool(server) {
+    const schema = {
+        sql: z.string().min(1, "SQL query cannot be empty"),
+        batchSize: z.number().min(100).max(10000).optional().default(1000),
+        maxRows: z.number().min(1).max(1000000).optional().default(100000).describe("Maximum total rows to process across all batches."),
+        parameters: z.record(z.any()).optional(),
+        cursorField: z.string().optional().describe("Field for cursor pagination; determined from ORDER BY if not set."),
+        outputType: z.enum(['json', 'csv', 'summary']).optional().default('summary').describe("Format for saved results file."),
+        aggregations: z.array(
+            z.object({
+                field: z.string(),
+                operation: z.enum(['sum', 'avg', 'min', 'max', 'count', 'countDistinct'])
+            })
+        ).optional().describe("Aggregations to perform over the streamed results.")
+    };
+
+    const handler = async ({
+        sql,
+        batchSize = 1000,
+        maxRows = 100000,
+        parameters = {},
         cursorField,
         outputType = 'summary',
         aggregations
     }) => {
-        // Basic validation to prevent destructive operations
         const lowerSql = sql.toLowerCase();
         const prohibitedOperations = ['drop ', 'delete ', 'truncate ', 'update ', 'alter '];
-        
         if (prohibitedOperations.some(op => lowerSql.includes(op))) {
             return {
-                content: [{
-                    type: "text",
-                    text: "⚠️ Error: Data modification operations (DROP, DELETE, UPDATE, TRUNCATE, ALTER) are not allowed for safety reasons."
-                }],
-                isError: true
+                content: [{ type: "text", text: "⚠️ Error: Data modification operations are not allowed." }],
+                isError: true,
+                error: createJsonRpcError(-32000, "Data modification operations are not allowed.")
             };
         }
-        
+
         try {
-            // Determine cursor field if not provided
             const defaultCursorField = extractDefaultCursorField(sql);
             const effectiveCursorField = cursorField || defaultCursorField;
-            
+            if (!effectiveCursorField) {
+                throw new Error("Cursor field is required for streaming. Provide cursorField or ensure SQL has an ORDER BY clause.");
+            }
             logger.info(`Starting query streamer with cursor field: ${effectiveCursorField}, batch size: ${batchSize}, max rows: ${maxRows}`);
-            
-            // Initialize aggregation accumulators if needed
+
             const aggregationResults = {};
             if (aggregations) {
                 aggregations.forEach(agg => {
-                    const { field, operation } = agg;
-                    switch (operation) {
-                        case 'sum':
-                        case 'avg':
-                            aggregationResults[`${operation}:${field}`] = 0;
-                            break;
-                        case 'min':
-                            aggregationResults[`min:${field}`] = Number.MAX_VALUE;
-                            break;
-                        case 'max':
-                            aggregationResults[`max:${field}`] = Number.MIN_VALUE;
-                            break;
-                        case 'count':
-                            aggregationResults[`count:${field}`] = 0;
-                            break;
-                        case 'countDistinct':
-                            aggregationResults[`countDistinct:${field}`] = new Set();
-                            break;
-                    }
+                    const key = `${agg.operation}:${agg.field}`;
+                    if (agg.operation === 'sum' || agg.operation === 'avg') aggregationResults[key] = 0;
+                    else if (agg.operation === 'min') aggregationResults[key] = Number.MAX_VALUE;
+                    else if (agg.operation === 'max') aggregationResults[key] = Number.MIN_VALUE;
+                    else if (agg.operation === 'count') aggregationResults[key] = 0;
+                    else if (agg.operation === 'countDistinct') aggregationResults[key] = new Set();
                 });
             }
-            
-            // Variables for tracking streaming state
-            let cursor = null;
+
+            let currentCursor = null;
             let totalProcessedRows = 0;
-            let hasMore = true;
+            let hasMoreData = true;
             let batchCount = 0;
-            let allResults = [];
-            
-            // Setup for CSV output
-            let csvOutput = '';
-            let headers = [];
-            
-            // UUID for the output file
+            let allResultsForJson = []; // Only used if outputType is 'json'
+            let csvHeaderWritten = false;
+            let csvWriteStream; // For CSV streaming to file
+
             const uuid = crypto.randomUUID();
-            const outputPath = path.join(QUERY_RESULTS_PATH, `${uuid}.${outputType === 'csv' ? 'csv' : 'json'}`);
-            
-            // Start streaming
-            logger.info(`Beginning streaming query execution`);
-            const startTime = Date.now();
-            
-            // Streaming loop
-            while (hasMore && totalProcessedRows < maxRows) {
+            const fileExtension = outputType === 'csv' ? 'csv' : 'json';
+            const outputPath = path.join(QUERY_RESULTS_PATH, `${uuid}.${fileExtension}`);
+            if (!fs.existsSync(QUERY_RESULTS_PATH)) fs.mkdirSync(QUERY_RESULTS_PATH, { recursive: true });
+
+            if (outputType === 'csv') {
+                csvWriteStream = fs.createWriteStream(outputPath);
+            }
+
+            logger.info(`Beginning streaming query execution. Output to: ${outputPath}`);
+            const overallStartTime = Date.now();
+
+            while (hasMoreData && totalProcessedRows < maxRows) {
                 batchCount++;
-                
-                // Apply pagination for this batch
-                const { paginatedSql, parameters: paginatedParams } = 
-                    paginateQuery(sql, { 
-                        cursorField: effectiveCursorField, 
-                        pageSize: batchSize, 
-                        cursor, 
+                const remainingRowsToFetch = maxRows - totalProcessedRows;
+                const currentBatchSize = Math.min(batchSize, remainingRowsToFetch);
+
+                if (currentBatchSize <= 0) { // Should not happen if maxRows logic is correct
+                    hasMoreData = false;
+                    break;
+                }
+
+                const { paginatedSql, parameters: paginatedParams } =
+                    paginateQuery(sql, {
+                        cursorField: effectiveCursorField,
+                        pageSize: currentBatchSize,
+                        cursor: currentCursor,
                         parameters,
                         defaultCursorField
                     });
-                
-                logger.info(`Executing batch ${batchCount} with cursor: ${cursor || 'initial'}`);
-                
-                // Execute this batch
+
+                logger.info(`Executing batch ${batchCount} (size ${currentBatchSize}) with cursor: ${currentCursor || 'initial'}`);
                 const batchStartTime = Date.now();
                 const batchResult = await executeQuery(paginatedSql, paginatedParams);
                 const batchTime = Date.now() - batchStartTime;
-                
                 const batchRows = batchResult.recordset || [];
                 const batchRowCount = batchRows.length;
-                
-                // Update total and check if we have more data
+
                 totalProcessedRows += batchRowCount;
-                hasMore = batchRowCount >= batchSize && totalProcessedRows < maxRows;
-                
-                logger.info(`Batch ${batchCount} returned ${batchRowCount} rows in ${batchTime}ms, total rows: ${totalProcessedRows}`);
-                
-                // Set up headers on first batch if needed
-                if (batchCount === 1 && batchRowCount > 0) {
-                    headers = Object.keys(batchRows[0]);
-                    
-                    // Initialize CSV with headers if using CSV output
-                    if (outputType === 'csv') {
-                        csvOutput = headers.join(',') + '\n';
-                    }
-                }
-                
-                // Process this batch
+                hasMoreData = batchRowCount >= currentBatchSize; // If we got less than requested, no more data
+
+                logger.info(`Batch ${batchCount} returned ${batchRowCount} rows in ${batchTime}ms. Total rows processed: ${totalProcessedRows}. Has more: ${hasMoreData}`);
+
                 if (batchRowCount > 0) {
-                    // Update cursor for next batch
-                    if (hasMore) {
-                        cursor = generateNextCursor(batchRows[batchRowCount - 1], effectiveCursorField);
+                    if (hasMoreData) {
+                        currentCursor = generateNextCursor(batchRows[batchRowCount - 1], effectiveCursorField);
                     }
-                    
-                    // Process rows according to output type
+
                     if (outputType === 'json') {
-                        // For JSON, collect all results
-                        allResults = [...allResults, ...batchRows];
+                        allResultsForJson.push(...batchRows);
                     } else if (outputType === 'csv') {
-                        // For CSV, append rows to the CSV string
-                        batchRows.forEach(row => {
-                            const csvRow = headers.map(header => {
-                                const value = row[header];
-                                if (value === null) return '';
-                                if (typeof value === 'string') return `"${value.replace(/"/g, '""')}"`;
-                                return String(value);
-                            }).join(',');
-                            
-                            csvOutput += csvRow + '\n';
-                        });
+                        if (!csvHeaderWritten && batchRows.length > 0) {
+                            const headers = Object.keys(batchRows[0]);
+                            await new Promise(resolve => csvWriteStream.write(headers.join(',') + '\n', resolve));
+                            csvHeaderWritten = true;
+                        }
+                        for (const row of batchRows) {
+                            const values = Object.values(row).map(v => {
+                                if (v === null || v === undefined) return '';
+                                if (typeof v === 'string') return `"${v.replace(/"/g, '""')}"`;
+                                return String(v);
+                            });
+                            await new Promise(resolve => csvWriteStream.write(values.join(',') + '\n', resolve));
+                        }
                     }
-                    
-                    // Process aggregations if requested
+
                     if (aggregations) {
                         batchRows.forEach(row => {
                             aggregations.forEach(agg => {
                                 const { field, operation } = agg;
                                 const value = row[field];
-                                
+                                const key = `${operation}:${field}`;
                                 if (value !== null && value !== undefined) {
-                                    const key = `${operation}:${field}`;
-                                    
                                     switch (operation) {
-                                        case 'sum':
-                                            if (typeof value === 'number') {
-                                                aggregationResults[key] += value;
-                                            }
-                                            break;
-                                        case 'avg':
-                                            if (typeof value === 'number') {
-                                                aggregationResults[key] += value;
-                                            }
-                                            break;
-                                        case 'min':
-                                            if (typeof value === 'number' && value < aggregationResults[key]) {
-                                                aggregationResults[key] = value;
-                                            }
-                                            break;
-                                        case 'max':
-                                            if (typeof value === 'number' && value > aggregationResults[key]) {
-                                                aggregationResults[key] = value;
-                                            }
-                                            break;
-                                        case 'count':
-                                            aggregationResults[key]++;
-                                            break;
-                                        case 'countDistinct':
-                                            aggregationResults[key].add(value);
-                                            break;
+                                        case 'sum': if (typeof value === 'number') aggregationResults[key] += value; break;
+                                        case 'avg': if (typeof value === 'number') aggregationResults[key] += value; break; // Sum for now, avg calculated at the end
+                                        case 'min': if (typeof value === 'number' && value < aggregationResults[key]) aggregationResults[key] = value; break;
+                                        case 'max': if (typeof value === 'number' && value > aggregationResults[key]) aggregationResults[key] = value; break;
+                                        case 'count': aggregationResults[key]++; break;
+                                        case 'countDistinct': aggregationResults[key].add(value); break;
                                     }
                                 }
                             });
                         });
                     }
                 }
-                
-                // Stop if we don't have more data
-                if (batchRowCount < batchSize) {
-                    hasMore = false;
+                 if (batchRowCount < currentBatchSize) { // If we fetched less than batch size, it means no more data
+                    hasMoreData = false;
                 }
             }
-            
-            const totalTime = Date.now() - startTime;
-            logger.info(`Streaming query completed in ${totalTime}ms, processed ${totalProcessedRows} rows in ${batchCount} batches`);
-            
-            // Finalize aggregations
+
+            const totalTime = Date.now() - overallStartTime;
+            logger.info(`Streaming query completed in ${totalTime}ms, processed ${totalProcessedRows} rows in ${batchCount} batches.`);
+
             if (aggregations) {
                 aggregations.forEach(agg => {
                     const { field, operation } = agg;
                     const key = `${operation}:${field}`;
-                    
                     if (operation === 'avg') {
-                        // Calculate average from sum and count
-                        const count = aggregationResults[`count:${field}`] || totalProcessedRows;
-                        if (count > 0) {
-                            aggregationResults[key] = aggregationResults[key] / count;
-                        }
+                        const countKey = `count:${field}`;
+                        const count = aggregationResults[countKey] || (aggregations.find(a => a.field === field && a.operation === 'count') ? 0 : totalProcessedRows); // Fallback to totalProcessedRows if no explicit count agg
+                        if (count > 0) aggregationResults[key] /= count; else aggregationResults[key] = 0;
                     } else if (operation === 'countDistinct') {
-                        // Convert Set to count
                         aggregationResults[key] = aggregationResults[key].size;
                     }
                 });
             }
             
-            // Save results to a file based on output type
-            try {
-                if (outputType === 'json') {
-                    // Save as JSON with metadata
-                    const resultWithMetadata = {
-                        metadata: {
-                            uuid,
-                            timestamp: new Date().toISOString(),
-                            query: sql,
-                            totalRows: totalProcessedRows,
-                            batchCount,
-                            executionTimeMs: totalTime,
-                            aggregations: aggregationResults
-                        },
-                        results: allResults
-                    };
-                    
-                    fs.writeFileSync(outputPath, JSON.stringify(resultWithMetadata, null, 2));
-                } else if (outputType === 'csv') {
-                    // Save as CSV
-                    fs.writeFileSync(outputPath, csvOutput);
-                } else {
-                    // Save summary if not JSON or CSV
-                    const summaryData = {
-                        metadata: {
-                            uuid,
-                            timestamp: new Date().toISOString(),
-                            query: sql,
-                            totalRows: totalProcessedRows,
-                            batchCount,
-                            executionTimeMs: totalTime,
-                            aggregations: aggregationResults
-                        }
-                    };
-                    
-                    fs.writeFileSync(outputPath, JSON.stringify(summaryData, null, 2));
-                }
-                
-                logger.info(`Streaming query results saved to ${outputPath}`);
-            } catch (writeError) {
-                logger.error(`Error saving streaming query results to file: ${writeError.message}`);
+            const streamMetadata = {
+                uuid,
+                timestamp: new Date().toISOString(),
+                query: sql,
+                totalRowsProcessed: totalProcessedRows,
+                batchCount,
+                executionTimeMs: totalTime,
+                outputType,
+                outputPath, // Include output path
+                aggregations: Object.keys(aggregationResults).length > 0 ? aggregationResults : undefined
+            };
+
+            if (outputType === 'json') {
+                fs.writeFileSync(outputPath, JSON.stringify({ metadata: streamMetadata, results: allResultsForJson }, null, 2));
+            } else if (outputType === 'csv') {
+                await new Promise(resolve => csvWriteStream.end(resolve)); // Close stream
+                 // For CSV, we might just save metadata separately or include it in summary
+                const metaFilePath = path.join(QUERY_RESULTS_PATH, `${uuid}.metadata.json`);
+                fs.writeFileSync(metaFilePath, JSON.stringify({metadata: streamMetadata }, null, 2));
+                logger.info(`CSV data saved to ${outputPath}, metadata to ${metaFilePath}`);
+            } else { // summary
+                fs.writeFileSync(outputPath, JSON.stringify({ metadata: streamMetadata }, null, 2));
             }
-            
-            // Format response markdown
-            let markdown = `# Streamed Query Results\n\n`;
-            
-            // Add summary stats
-            markdown += `## Summary\n\n`;
+            logger.info(`Streaming results processing complete. Output available at: ${outputPath}`);
+
+            let markdown = `# Streamed Query Summary\n\n`;
+            markdown += `## Overview\n\n`;
             markdown += `- **Total Rows Processed**: ${totalProcessedRows.toLocaleString()}\n`;
             markdown += `- **Batches**: ${batchCount}\n`;
             markdown += `- **Execution Time**: ${totalTime.toLocaleString()}ms\n`;
-            markdown += `- **Average Rate**: ${Math.round(totalProcessedRows / (totalTime / 1000)).toLocaleString()} rows/second\n`;
+            if (totalTime > 0) markdown += `- **Average Rate**: ${Math.round(totalProcessedRows / (totalTime / 1000)).toLocaleString()} rows/second\n`;
             markdown += `- **Output Type**: ${outputType}\n`;
-            markdown += `- **Output Location**: ${outputPath}\n\n`;
-            
-            // Add aggregation results if we have them
+            markdown += `- **Output File ID**: \`${uuid}\` (File: \`${path.basename(outputPath)}\`)\n\n`;
+
             if (aggregations && Object.keys(aggregationResults).length > 0) {
-                markdown += `## Aggregation Results\n\n`;
-                markdown += '| Field | Operation | Result |\n';
-                markdown += '|-------|-----------|--------|\n';
-                
+                markdown += `## Aggregation Results\n\n| Field | Operation | Result |\n|-------|-----------|--------|\n`;
                 aggregations.forEach(agg => {
-                    const { field, operation } = agg;
-                    const key = `${operation}:${field}`;
+                    const key = `${agg.operation}:${agg.field}`;
                     let value = aggregationResults[key];
-                    
-                    // Format the value for display
-                    if (typeof value === 'number') {
-                        value = value.toLocaleString(undefined, { 
-                            maximumFractionDigits: 4 
-                        });
-                    } else if (value instanceof Set) {
-                        value = value.size.toLocaleString();
-                    }
-                    
-                    markdown += `| ${field} | ${operation} | ${value} |\n`;
+                    if (typeof value === 'number') value = value.toLocaleString(undefined, { maximumFractionDigits: 4 });
+                    markdown += `| ${agg.field} | ${agg.operation} | ${value} |\n`;
                 });
-                
                 markdown += '\n';
             }
-            
-            // Add data access info
+
             markdown += `## Accessing Results\n\n`;
-            
+            markdown += `Results data saved with ID: \`${uuid}\`.\n`;
             if (outputType === 'json' || outputType === 'summary') {
-                markdown += `To access these results, use:\n\n`;
-                markdown += `\`\`\`javascript\n`;
-                markdown += `mcp__get_query_results({ uuid: "${uuid}" })\n`;
-                markdown += `\`\`\`\n\n`;
-            } else {
-                markdown += `Results have been saved as a CSV file with ID: ${uuid}\n\n`;
+                 markdown += `To load metadata (and results if JSON): \`mcp_get_query_results({ uuid: "${uuid}" })\`\n`;
+            } else if (outputType === 'csv') {
+                markdown += `CSV data saved to file. Metadata accessible via: \`mcp_get_query_results({ uuid: "${uuid}.metadata" })\` (or similar, check actual file name for metadata)\nAlternatively, the file path is: ${outputPath}\n`;
             }
-            
-            // Add sample data preview if available
-            if (allResults.length > 0 && outputType === 'json') {
-                markdown += `## Data Sample\n\n`;
-                
-                const previewRows = allResults.slice(0, 5);
-                
-                // Table headers
-                markdown += '| ' + Object.keys(previewRows[0]).join(' | ') + ' |\n';
-                markdown += '| ' + Object.keys(previewRows[0]).map(() => '---').join(' | ') + ' |\n';
-                
-                // Table rows
-                previewRows.forEach(row => {
-                    markdown += '| ' + Object.values(row).map(v => {
-                        if (v === null) return 'NULL';
-                        if (v === undefined) return '';
-                        if (typeof v === 'object') return JSON.stringify(v);
-                        return String(v);
-                    }).join(' | ') + ' |\n';
-                });
-                
-                markdown += `\n_Sample of ${previewRows.length} rows from ${totalProcessedRows} total rows_\n`;
-            }
-            
+             markdown += `The raw file path is: \`${outputPath}\` (access might be restricted).\n`;
+
+
             return {
-                content: [{
-                    type: "text",
-                    text: markdown
-                }],
-                metadata: {
-                    streaming: {
-                        uuid,
-                        totalRows: totalProcessedRows,
-                        batchCount,
-                        executionTimeMs: totalTime,
-                        outputType,
-                        aggregations: aggregationResults
-                    }
+                content: [{ type: "text", text: markdown }],
+                result: { // Return metadata about the stream process itself
+                    streamingSummary: streamMetadata
                 }
             };
         } catch (err) {
             logger.error(`Error executing streaming query: ${err.message}`);
-            
+            const formattedError = formatSqlError(err);
             return {
-                content: [{
-                    type: "text",
-                    text: `Error executing streaming query: ${formatSqlError(err)}`
-                }],
-                isError: true
+                content: [{ type: "text", text: `Error executing streaming query: ${formattedError}` }],
+                isError: true,
+                error: createJsonRpcError(-32001, `Streaming query failed: ${formattedError}`)
             };
         }
     };
-
-    const schema = {
-        sql: z.string().min(1, "SQL query cannot be empty"),
-        batchSize: z.number().min(100).max(10000).optional().default(1000),
-        maxRows: z.number().min(1).max(1000000).optional().default(100000),
-        parameters: z.record(z.any()).optional(),
-        cursorField: z.string().optional(),
-        outputType: z.enum(['json', 'csv', 'summary']).optional().default('summary'),
-        aggregations: z.array(
-            z.object({
-                field: z.string(),
-                operation: z.enum(['sum', 'avg', 'min', 'max', 'count', 'countDistinct'])
-            })
-        ).optional()
-    };
-    
-    if (registerWithAlias) {
-        registerWithAlias("query_streamer", schema, handler);
-    } else {
-        server.tool("mcp_query_streamer", schema, handler);
-    }
+    registerTool(server, "mcp_query_streamer", schema, handler);
 }
 
 // Export the database tools for use in the server
 export {
     registerDatabaseTools,
-    registerExecuteQueryTool,
-    registerTableDetailsTool,
-    registerProcedureDetailsTool,
-    registerFunctionDetailsTool,
-    registerViewDetailsTool,
-    registerIndexDetailsTool,
-    registerDiscoverTablesTool,
-    registerDiscoverDatabaseTool,
-    registerGetQueryResultsTool,
-    registerDiscoverTool,
-    registerCursorGuideTool,
-    registerPaginatedQueryTool,
-    registerQueryStreamerTool
+    // Individual registration functions are not typically exported if registerDatabaseTools is the main entry point
+    // registerExecuteQueryTool,
+    // registerTableDetailsTool,
+    // registerProcedureDetailsTool,
+    // registerFunctionDetailsTool,
+    // registerViewDetailsTool,
+    // registerIndexDetailsTool,
+    // registerDiscoverTablesTool,
+    // registerDiscoverDatabaseTool,
+    // registerGetQueryResultsTool,
+    // registerDiscoverDatabaseOverviewTool, // Renamed
+    // registerPaginationGuideTool,      // Renamed
+    // registerPaginatedQueryTool,
+    // registerQueryStreamerTool
 };

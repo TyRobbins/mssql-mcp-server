@@ -140,10 +140,6 @@ try {
     logger.info("Registering database tools...");
     registerDatabaseTools(server);
 
-    // Debug log of registered tools
-    console.log("DEBUG: Tools after registration:");
-    console.log(Object.keys(server._tools || {}));
-
     // Register database resources (tables, schema, views, etc.)
     logger.info("Registering database resources...");
     registerDatabaseResources(server);
@@ -152,11 +148,12 @@ try {
     logger.info("Registering prompts...");
     registerPrompts(server);
 
-    // Debug log for tools
+    // Debug log for tools after all registrations
     const registeredTools = Object.keys(server._tools || {});
     logger.info(`Registered tools (${registeredTools.length}): ${registeredTools.join(', ')}`);
+    // console.log("DEBUG: Final registered tools:", registeredTools); // Optional: for more verbose debugging
 } catch (error) {
-    logger.error(`Failed to register tools: ${error.message}`);
+    logger.error(`Failed to register MCP components: ${error.message}`);
     logger.error(error.stack);
 }
 
@@ -454,9 +451,9 @@ app.get('/sse', async (req, res) => {
                     params: {
                         type: "info",
                         message: `# Welcome to MSSQL MCP Server v${server.options?.version || "1.1.0"} 🚀\n\n` +
-                            `To explore the database, use these commands:\n\n` +
+                            `To explore the database, use a command like:\n\n` +
                             `\`\`\`javascript\n` +
-                            `mcp__discover_database()\n` +
+                            `mcp_discover_database_overview()\n` + // Updated tool name
                             `\`\`\``
                     }
                 };
@@ -489,11 +486,11 @@ app.get('/sse', async (req, res) => {
                                 message: `## Example Commands\n\n` +
                                     `Get table details:\n` +
                                     `\`\`\`javascript\n` +
-                                    `mcp__table_details({ tableName: "${sampleTable}" })\n` +
+                                    `mcp_table_details({ tableName: "${sampleTable}" }) // Assumes schema.table if not specified, or just table if in default schema \n` +
                                     `\`\`\`\n\n` +
                                     `Execute a query:\n` +
                                     `\`\`\`javascript\n` +
-                                    `mcp__execute_query({ sql: "SELECT TOP 10 * FROM ${sampleTable}" })\n` +
+                                    `mcp_execute_query({ sql: "SELECT TOP 10 * FROM ${sampleTable}" })\n` +
                                     `\`\`\``
                             }
                         };
@@ -539,150 +536,120 @@ app.post('/messages', (req, res) => {
         logger.info(`Processing message ID: ${requestId}, method: ${method}`);
         logger.info(`Request body: ${JSON.stringify(req.body)}`);
 
-        // Special handling for cursor guide tool
+        // Special handling for pagination guide tool
         if (method === 'tools/call' &&
-            (req.body.params?.name === 'mcp_cursor_guide' ||
-                req.body.params?.name === 'cursor_guide')) {
+            (req.body.params?.name === 'mcp_pagination_guide' || // Updated name
+                req.body.params?.name === 'pagination_guide')) { // Alias for direct call
 
-            logger.info('Direct handling for cursor guide tool');
+            logger.info('Direct handling for pagination guide tool');
 
-            // Comprehensive guide for cursor-based pagination
+            // This guide text should ideally be fetched from the tool's definition
+            // or a shared constant to avoid duplication. For now, it's replicated.
+            // This is the updated guide text from Lib/tools.mjs's mcp_pagination_guide.
             const guideText = `
 # SQL Cursor-Based Pagination Guide
 
 Cursor-based pagination is an efficient approach for paginating through large datasets, especially when:
-- You need stable pagination through frequently changing data
-- You're handling very large datasets where OFFSET/LIMIT becomes inefficient
-- You want better performance for deep pagination
+- You need stable pagination through frequently changing data.
+- You're handling very large datasets where OFFSET/LIMIT becomes inefficient.
+- You want better performance for deep pagination.
 
 ## Key Concepts
 
-1. **Cursor**: A pointer to a specific item in a dataset, typically based on a unique, indexed field
-2. **Direction**: You can paginate forward (next) or backward (previous)
-3. **Page Size**: The number of items to return per request
+1.  **Cursor**: A pointer to a specific item in a dataset, typically based on a unique, indexed field (or combination of fields).
+2.  **Direction**: You can paginate forward ('next') or backward ('prev').
+3.  **Page Size**: The number of items to return per request.
+4.  **Cursor Field**: The field(s) used for ordering and creating the cursor. Must be consistently ordered.
 
-## Example Usage
-
-Using cursor-based pagination with our SQL tools:
+## Example Usage with \`mcp_paginated_query\`
 
 \`\`\`javascript
-// First page (no cursor)
+// First page (no cursor provided)
 const firstPage = await tool.call("mcp_paginated_query", {
-  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC",
+  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC, id DESC", // Consistent ORDER BY
   pageSize: 20,
-  cursorField: "created_at"
+  cursorField: "created_at,id" // Compound cursor field if created_at is not unique
 });
+
+// Response from firstPage might include:
+// firstPage.result.metadata.pagination.nextCursor = "some_encoded_cursor_value"
 
 // Next page (using cursor from previous response)
-const nextPage = await tool.call("mcp_paginated_query", {
-  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC",
-  pageSize: 20,
-  cursorField: "created_at",
-  cursor: firstPage.result.pagination.nextCursor,
-  direction: "next"
-});
+if (firstPage.result.metadata.pagination.nextCursor) {
+  const nextPage = await tool.call("mcp_paginated_query", {
+    sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC, id DESC",
+    pageSize: 20,
+    cursorField: "created_at,id",
+    cursor: firstPage.result.metadata.pagination.nextCursor,
+    direction: "next" // Default is 'next', can be explicit
+  });
+}
 
-// Previous page (going back)
-const prevPage = await tool.call("mcp_paginated_query", {
-  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC",
-  pageSize: 20,
-  cursorField: "created_at",
-  cursor: nextPage.result.pagination.prevCursor,
-  direction: "prev"
-});
+// Previous page (going back from nextPage)
+// nextPage.result.metadata.pagination.prevCursor = "another_encoded_cursor_value"
+if (nextPage.result.metadata.pagination.prevCursor) {
+  const prevPage = await tool.call("mcp_paginated_query", {
+    sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC, id DESC",
+    pageSize: 20,
+    cursorField: "created_at,id",
+    cursor: nextPage.result.metadata.pagination.prevCursor,
+    direction: "prev"
+  });
+}
 \`\`\`
 
 ## Best Practices
 
-1. **Choose an appropriate cursor field**:
-   - Should be unique or nearly unique (ideally indexed)
-   - Common choices: timestamps, auto-incrementing IDs
-   - Compound cursors can be used for non-unique fields (e.g., "timestamp:id")
+1.  **Choose an appropriate \`cursorField\`**:
+    *   Should be unique or a combination of fields that guarantees uniqueness (e.g., "timestamp,id").
+    *   The field(s) must be indexed for performance.
+    *   Common choices: creation/update timestamps, auto-incrementing IDs.
 
-2. **Order matters**:
-   - Always include an ORDER BY clause that includes your cursor field
-   - Consistent ordering is essential (always ASC or always DESC)
+2.  **Consistent \`ORDER BY\` Clause**:
+    *   The \`ORDER BY\` clause in your SQL query **must** match the \`cursorField\` and its order.
+    *   For descending order on a field, the pagination logic will handle it correctly.
+    *   If \`cursorField\` is compound (e.g., "field1,field2"), the \`ORDER BY\` should be \`ORDER BY field1, field2\`.
 
-3. **Handle edge cases**:
-   - First/last page detection
-   - Empty result sets
-   - Missing or invalid cursors
+3.  **Use \`mcp_paginated_query\`**: This tool is specifically designed for robust cursor-based pagination.
 
-4. **Performance considerations**:
-   - Use indexed fields for cursors
-   - Avoid expensive joins in paginated queries
-   - Consider caching results for frequently accessed pages
+4.  **Subqueries**: For complex queries, consider applying pagination to a simplified subquery that provides the ordered keys/cursor fields, then join the full data.
 `;
-
             const result = {
-                content: [{
-                    type: "text",
-                    text: guideText
-                }]
+                content: [{ type: "text", text: guideText }],
+                result: { guide: "SQL pagination guide provided successfully." } // Matching result structure
             };
 
-            // Don't send response via HTTP, just SSE which is what Claude expects
-            // Also send via SSE for any listeners
-            if (currentTransport) {
-                // Proper JSON-RPC formatting is critical
-                const sseResponse = {
-                    jsonrpc: "2.0",
-                    id: requestId,
-                    result: result
-                };
-
-                // Write direct to the SSE connection with event: message format
-                if (currentTransport.res && !currentTransport.res.finished) {
-                    currentTransport.res.write(`event: message\n`);
-                    currentTransport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
-
-                    // Send a success response to the HTTP POST
-                    res.status(200).json({ success: true });
-                } else {
-                    // If SSE connection is closed, fallback to HTTP response
-                    res.status(200).json(sseResponse);
-                }
+            if (currentTransport && currentTransport.res && !currentTransport.res.finished) {
+                const sseResponse = { jsonrpc: "2.0", id: requestId, result };
+                currentTransport.res.write(`event: message\n`);
+                currentTransport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
+                res.status(200).json({ success: true, message: "Response sent via SSE." });
             } else {
-                // Fallback to HTTP response if no SSE transport
-                res.status(200).json({
-                    jsonrpc: "2.0",
-                    id: requestId,
-                    result: result
-                });
+                res.status(200).json({ jsonrpc: "2.0", id: requestId, result });
             }
-
             return;
         }
 
-        // Special handling for tool calls - properly send via SSE transport
+        // General tool call handling
         if (method === 'tools/call') {
             const toolName = req.body.params?.name;
             const toolArgs = req.body.params?.arguments || {};
 
             logger.info(`Direct handling for tool call: ${toolName}`);
 
-            // Try to find the tool with various name patterns
-            const possibleToolNames = [
-                toolName,                                   // Original name
-                toolName.startsWith('mcp_') ? toolName : `mcp_${toolName}`, // Ensure mcp_ prefix
-                toolName.startsWith('mcp_SQL_') ? toolName : `mcp_SQL_${toolName}`, // Ensure mcp_SQL_ prefix
-                toolName.replace('mcp_', 'mcp_SQL_'),       // Convert mcp_ to mcp_SQL_
-                toolName.replace('mcp_SQL_', 'mcp_')        // Convert mcp_SQL_ to mcp_
-            ];
-
+            // Standardized tool names are expected to be `mcp_verb_noun`.
+            // This logic attempts to find the tool if the client provides the name
+            // with or without the `mcp_` prefix.
             let foundToolName = null;
-
-            for (const name of possibleToolNames) {
-                if (server._tools && server._tools[name]) {
-                    foundToolName = name;
-                    logger.info(`Found tool handler for: ${name}`);
-                    break;
-                }
+            if (server._tools && server._tools[toolName]) {
+                foundToolName = toolName;
+            } else if (!toolName.startsWith('mcp_') && server._tools && server._tools[`mcp_${toolName}`]) {
+                foundToolName = `mcp_${toolName}`;
             }
 
             if (foundToolName) {
-                // Execute the tool and get result
-                server.executeToolCall(foundToolName, toolArgs)
+                logger.info(`Found tool handler for: ${foundToolName}`);
+                server.executeToolCall(foundToolName, toolArgs) // Execute the tool
                     .then(result => {
                         logger.info(`Direct tool result obtained successfully`);
 
@@ -775,35 +742,42 @@ const prevPage = await tool.call("mcp_paginated_query", {
             }
         }
 
-        // Special case for SSEServerTransport - monkey patch its send method to ensure correct format
-        // This affects all other tool calls that go through the standard transport
-        if (currentTransport && typeof currentTransport.send === 'function') {
+        // Monkey-patch SSEServerTransport.send to ensure JSON-RPC responses are consistently formatted
+        // with "event: message" and "data: {...}\n\n". This is crucial for compatibility with
+        // clients that strictly expect this SSE message structure for MCP responses,
+        // potentially due to interpretations of early MCP SSE guidelines or specific client libraries.
+        // If the underlying SDK's SSEServerTransport.send method natively supports this format
+        // reliably in the future, this patch may be re-evaluated.
+        if (currentTransport && typeof currentTransport.send === 'function' && !currentTransport.isPatched) {
             const originalSend = currentTransport.send;
             currentTransport.send = function (message) {
-                logger.info(`Intercepting SSE transport send: ${JSON.stringify(message)}`);
+                // logger.info(`Intercepting SSE transport send: ${JSON.stringify(message)}`); // Can be verbose
 
-                // Don't use the original send for JSON-RPC responses, write directly to the stream
-                if (message.jsonrpc === "2.0" && message.id && (message.result || message.error)) {
+                // For JSON-RPC responses (identified by having an id and either result or error),
+                // write directly to the SSE stream in the "event: message\ndata: {...}\n\n" format.
+                if (message && message.jsonrpc === "2.0" && message.id && (message.hasOwnProperty('result') || message.hasOwnProperty('error'))) {
                     if (this.res && !this.res.finished) {
-                        // Write the message with event: message format as per GitHub reference
                         this.res.write(`event: message\n`);
                         this.res.write(`data: ${JSON.stringify(message)}\n\n`);
-
-                        // No need for separate completion event with this format
-                        logger.info(`Sent message event for request ID: ${message.id}`);
+                        logger.info(`Sent JSON-RPC response via patched SSE send for ID: ${message.id}`);
                         return;
+                    } else {
+                        logger.warn(`SSE transport response stream closed or unavailable for message ID: ${message.id}`);
                     }
+                } else {
+                    // For other types of messages (e.g., notifications without ID, or non-JSON-RPC),
+                    // fall back to the original send behavior.
+                    logger.info(`Using original SSE send for non-standard JSON-RPC response or notification.`);
+                    return originalSend.call(this, message);
                 }
-
-                // Fall back to original behavior for other messages
-                return originalSend.call(this, message);
             };
+            currentTransport.isPatched = true; // Mark as patched to avoid re-patching
         }
 
         // For standard message handling (non-tool calls or tools we couldn't handle directly)
-        // Let the SSEServerTransport handle it with our monkey-patched send method
+        // Let the SSEServerTransport handle it. If patched, our custom send logic will be used for responses.
         currentTransport.handlePostMessage(req, res, req.body);
-        logger.info(`Message processed via SSE transport for request ID: ${requestId}`);
+        logger.info(`Message delegated to SSE transport for request ID: ${requestId}`);
 
     } catch (error) {
         logger.error(`Error processing message: ${error.message}`);
@@ -896,109 +870,109 @@ app.get('/query-results/:uuid', (req, res) => {
     }
 });
 
-// Add a debugging endpoint to directly register the cursor guide tool
-app.get('/debug/register-cursor-guide', (req, res) => {
+// Add a debugging endpoint to directly register the pagination guide tool
+app.get('/debug/register-pagination-guide', (req, res) => { // Renamed endpoint
     try {
-        logger.info('Manually registering cursor guide tool');
+        logger.info('Manually registering pagination guide tool');
 
-        // Create cursor guide tool schema and handler
-        const cursorGuideSchema = {
-            random_string: z.string().optional().describe("Dummy parameter for no-parameter tools")
+        // Schema for mcp_pagination_guide (should match Lib/tools.mjs)
+        const paginationGuideSchema = {
+            random_string: z.string().optional().describe("Optional dummy parameter, not used by the tool's logic. Provided for compatibility if tools without parameters are not fully supported.")
         };
 
-        const cursorGuideHandler = async (args) => {
-            // Comprehensive guide for cursor-based pagination
+        // Handler for mcp_pagination_guide (should match Lib/tools.mjs)
+        const paginationGuideHandler = async (args) => {
             const guideText = `
 # SQL Cursor-Based Pagination Guide
 
 Cursor-based pagination is an efficient approach for paginating through large datasets, especially when:
-- You need stable pagination through frequently changing data
-- You're handling very large datasets where OFFSET/LIMIT becomes inefficient
-- You want better performance for deep pagination
+- You need stable pagination through frequently changing data.
+- You're handling very large datasets where OFFSET/LIMIT becomes inefficient.
+- You want better performance for deep pagination.
 
 ## Key Concepts
 
-1. **Cursor**: A pointer to a specific item in a dataset, typically based on a unique, indexed field
-2. **Direction**: You can paginate forward (next) or backward (previous)
-3. **Page Size**: The number of items to return per request
+1.  **Cursor**: A pointer to a specific item in a dataset, typically based on a unique, indexed field (or combination of fields).
+2.  **Direction**: You can paginate forward ('next') or backward ('prev').
+3.  **Page Size**: The number of items to return per request.
+4.  **Cursor Field**: The field(s) used for ordering and creating the cursor. Must be consistently ordered.
 
-## Example Usage
-
-Using cursor-based pagination with our SQL tools:
+## Example Usage with \`mcp_paginated_query\`
 
 \`\`\`javascript
-// First page (no cursor)
+// First page (no cursor provided)
 const firstPage = await tool.call("mcp_paginated_query", {
-  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC",
+  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC, id DESC", // Consistent ORDER BY
   pageSize: 20,
-  cursorField: "created_at"
+  cursorField: "created_at,id" // Compound cursor field if created_at is not unique
 });
+
+// Response from firstPage might include:
+// firstPage.result.metadata.pagination.nextCursor = "some_encoded_cursor_value"
 
 // Next page (using cursor from previous response)
-const nextPage = await tool.call("mcp_paginated_query", {
-  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC",
-  pageSize: 20,
-  cursorField: "created_at",
-  cursor: firstPage.result.pagination.nextCursor,
-  direction: "next"
-});
+if (firstPage.result.metadata.pagination.nextCursor) {
+  const nextPage = await tool.call("mcp_paginated_query", {
+    sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC, id DESC",
+    pageSize: 20,
+    cursorField: "created_at,id",
+    cursor: firstPage.result.metadata.pagination.nextCursor,
+    direction: "next" // Default is 'next', can be explicit
+  });
+}
 
-// Previous page (going back)
-const prevPage = await tool.call("mcp_paginated_query", {
-  sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC",
-  pageSize: 20,
-  cursorField: "created_at",
-  cursor: nextPage.result.pagination.prevCursor,
-  direction: "prev"
-});
+// Previous page (going back from nextPage)
+// nextPage.result.metadata.pagination.prevCursor = "another_encoded_cursor_value"
+if (nextPage.result.metadata.pagination.prevCursor) {
+  const prevPage = await tool.call("mcp_paginated_query", {
+    sql: "SELECT id, name, created_at FROM users ORDER BY created_at DESC, id DESC",
+    pageSize: 20,
+    cursorField: "created_at,id",
+    cursor: nextPage.result.metadata.pagination.prevCursor,
+    direction: "prev"
+  });
+}
 \`\`\`
 
 ## Best Practices
 
-1. **Choose an appropriate cursor field**:
-   - Should be unique or nearly unique (ideally indexed)
-   - Common choices: timestamps, auto-incrementing IDs
-   - Compound cursors can be used for non-unique fields (e.g., "timestamp:id")
+1.  **Choose an appropriate \`cursorField\`**:
+    *   Should be unique or a combination of fields that guarantees uniqueness (e.g., "timestamp,id").
+    *   The field(s) must be indexed for performance.
+    *   Common choices: creation/update timestamps, auto-incrementing IDs.
 
-2. **Order matters**:
-   - Always include an ORDER BY clause that includes your cursor field
-   - Consistent ordering is essential (always ASC or always DESC)
+2.  **Consistent \`ORDER BY\` Clause**:
+    *   The \`ORDER BY\` clause in your SQL query **must** match the \`cursorField\` and its order.
+    *   For descending order on a field, the pagination logic will handle it correctly.
+    *   If \`cursorField\` is compound (e.g., "field1,field2"), the \`ORDER BY\` should be \`ORDER BY field1, field2\`.
 
-3. **Handle edge cases**:
-   - First/last page detection
-   - Empty result sets
-   - Missing or invalid cursors
+3.  **Use \`mcp_paginated_query\`**: This tool is specifically designed for robust cursor-based pagination.
 
-4. **Performance considerations**:
-   - Use indexed fields for cursors
-   - Avoid expensive joins in paginated queries
-   - Consider caching results for frequently accessed pages
+4.  **Subqueries**: For complex queries, consider applying pagination to a simplified subquery that provides the ordered keys/cursor fields, then join the full data.
 `;
-
             return {
-                content: [{
-                    type: "text",
-                    text: guideText
-                }]
+                content: [{ type: "text", text: guideText }],
+                result: { guide: "SQL pagination guide provided successfully." }
             };
         };
 
-        // Register with only mcp_ prefix for consistency
-        server.tool("mcp_cursor_guide", cursorGuideSchema, cursorGuideHandler);
+        // Register the tool using the canonical name
+        server.tool("mcp_pagination_guide", paginationGuideSchema, paginationGuideHandler);
 
-        // Make sure these are directly accessible in _tools
+        // Ensure it's available via server._tools if other parts rely on this for direct access
+        // This direct manipulation might be redundant if server.tool() correctly populates it.
         if (!server._tools) server._tools = {};
-        server._tools["mcp_cursor_guide"] = { schema: cursorGuideSchema, handler: cursorGuideHandler };
+        server._tools["mcp_pagination_guide"] = { schema: paginationGuideSchema, handler: paginationGuideHandler };
 
         const toolNames = Object.keys(server._tools || {});
 
         res.status(200).json({
             success: true,
-            message: 'Cursor guide tool manually registered',
+            message: 'Pagination guide tool (mcp_pagination_guide) manually registered.',
             tools: toolNames
         });
     } catch (error) {
-        logger.error(`Error registering cursor guide tool: ${error.message}`);
+        logger.error(`Error registering pagination guide tool: ${error.message}`);
         res.status(500).json({
             success: false,
             error: error.message

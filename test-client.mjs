@@ -32,7 +32,7 @@ async function main() {
     // Call SQL tool
     console.log('Executing SQL query...');
     try {
-      const result = await client.callTool('SQL_execute_query', {
+      const result = await client.callTool('mcp_execute_query', { // Updated name
         sql: 'SELECT TOP 5 name FROM sys.tables'
       });
       
