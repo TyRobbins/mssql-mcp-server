@@ -1,20 +1,24 @@
 // lib/database.js - Database utilities
 import sql from 'mssql';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { logger } from './logger.mjs';
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// Database configuration
+dotenv.config({ path: path.join(__dirname, '..', '.env') });
+
+// Primary Database configuration - ARCUSYM
 const dbConfig = {
-    user: process.env.DB_USER || 'sa',
-    password: process.env.DB_PASSWORD || 'YourStrong@Passw0rd',
-    server: process.env.DB_SERVER || 'localhost',
-    database: process.env.DB_DATABASE || 'master',
+    server: process.env.DB_SERVER || 'prodarcu',
+    database: process.env.DB_DATABASE || 'ARCUSYM000',
     port: parseInt(process.env.DB_PORT) || 1433,
     options: {
         encrypt: process.env.DB_ENCRYPT === 'true', 
-        trustServerCertificate: process.env.DB_TRUST_SERVER_CERT !== 'false',
+        trustServerCertificate: true, // Always trust server certificate to handle cert issues
+        enableArithAbort: process.env.DB_ENABLE_ARIAN !== 'false',
         connectionTimeout: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 15000,
         requestTimeout: parseInt(process.env.DB_REQUEST_TIMEOUT) || 15000,
         pool: {
@@ -25,29 +29,99 @@ const dbConfig = {
     }
 };
 
-// Global SQL pool
+// Configure authentication for primary DB
+if (process.env.DB_OPTIONS_TRUSTED_CONNECTION === 'true') {
+    // Use Windows Authentication with NTLM
+    dbConfig.authentication = {
+        type: 'ntlm',
+        options: {
+            domain: process.env.DB_DOMAIN || '',
+            userName: process.env.DB_WINDOWS_USER || '',
+            password: process.env.DB_WINDOWS_PASSWORD || ''
+        }
+    };
+} else {
+    // Use SQL Server Authentication
+    dbConfig.user = process.env.DB_USER || 'sa';
+    dbConfig.password = process.env.DB_PASSWORD || 'YourStrong@Passw0rd';
+}
+
+// Secondary Database configuration - Temenos
+const dbConfigTemenos = {
+    server: process.env.DB_SERVER_TEMENOS || 'decsql4',
+    database: process.env.DB_DATABASE_TEMENOS || 'Temenos',
+    port: parseInt(process.env.DB_PORT_TEMENOS) || 1433,
+    options: {
+        encrypt: process.env.DB_ENCRYPT === 'true', 
+        trustServerCertificate: true, // Always trust server certificate to handle cert issues
+        enableArithAbort: process.env.DB_ENABLE_ARIAN !== 'false',
+        connectionTimeout: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 15000,
+        requestTimeout: parseInt(process.env.DB_REQUEST_TIMEOUT) || 15000,
+        pool: {
+            max: parseInt(process.env.DB_POOL_MAX) || 10,
+            min: parseInt(process.env.DB_POOL_MIN) || 0,
+            idleTimeoutMillis: parseInt(process.env.DB_POOL_IDLE_TIMEOUT) || 30000
+        }
+    }
+};
+
+// Configure authentication for Temenos DB
+if (process.env.DB_OPTIONS_TRUSTED_CONNECTION_TEMENOS === 'true') {
+    // Use Windows Authentication with NTLM
+    dbConfigTemenos.authentication = {
+        type: 'ntlm',
+        options: {
+            domain: process.env.DB_DOMAIN_TEMENOS || '',
+            userName: process.env.DB_WINDOWS_USER_TEMENOS || '',
+            password: process.env.DB_WINDOWS_PASSWORD_TEMENOS || ''
+        }
+    };
+} else {
+    // Use SQL Server Authentication
+    dbConfigTemenos.user = process.env.DB_USER_TEMENOS || 'sa';
+    dbConfigTemenos.password = process.env.DB_PASSWORD_TEMENOS || 'YourStrong@Passw0rd';
+}
+
+// Global SQL pools
 let sqlPool = null;
+let sqlPoolTemenos = null;
 
 /**
- * Initialize the SQL connection pool
+ * Initialize the SQL connection pools for both databases
  * @returns {Promise<boolean>} - True if successful
  */
 export async function initializeDbPool() {
     try {
-        logger.info('Initializing SQL Server connection pool...');
+        logger.info('Initializing SQL Server connection pools...');
         
-        // Create and connect the pool
+        // Create and connect the primary pool (ARCUSYM)
         sqlPool = await new sql.ConnectionPool(dbConfig).connect();
         
         // Setup pool error handler
         sqlPool.on('error', err => {
-            logger.error(`SQL Pool Error: ${err.message}`);
+            logger.error(`ARCUSYM SQL Pool Error: ${err.message}`);
         });
         
-        logger.info(`SQL Server connection pool initialized successfully (${dbConfig.server}/${dbConfig.database})`);
+        logger.info(`ARCUSYM connection pool initialized successfully (${dbConfig.server}/${dbConfig.database})`);
+        
+        // Create and connect the Temenos pool
+        try {
+            sqlPoolTemenos = await new sql.ConnectionPool(dbConfigTemenos).connect();
+            
+            // Setup pool error handler
+            sqlPoolTemenos.on('error', err => {
+                logger.error(`Temenos SQL Pool Error: ${err.message}`);
+            });
+            
+            logger.info(`Temenos connection pool initialized successfully (${dbConfigTemenos.server}/${dbConfigTemenos.database})`);
+        } catch (temerr) {
+            logger.warn(`Failed to initialize Temenos connection pool: ${temerr.message}`);
+            // Continue with just ARCUSYM connection
+        }
+        
         return true;
     } catch (err) {
-        logger.error(`Failed to initialize SQL Server connection pool: ${err.message}`);
+        logger.error(`Failed to initialize SQL Server connection pools: ${err.message}`);
         throw err;
     }
 }
